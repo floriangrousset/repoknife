@@ -32,9 +32,42 @@ Run bare for the interactive menu, or script it: every module is a subcommand
 ## Folder convention
 
 ```
-~/Code/<provider>/<org>/<repo>              # github, gitlab
-~/Code/azure-devops/<org>/<project>/<repo>  # ADO is 3-level
+~/Code/github/<org>/<repo>
+~/Code/gitlab/<org>/<project>/<repo>        # project = subgroup · "No Project" if none
+~/Code/azure-devops/<org>/<project>/<repo>  # ADO is always 3-level
 ```
+
+For example:
+
+```
+~/Code/
+├── 🟦 github/
+│   ├── 🟪 acme/
+│   │   ├── 🟩 api-server/
+│   │   └── 🟩 webapp/
+│   └── 🟪 floriangrousset/
+│       └── 🟩 repoknife/
+├── 🟦 gitlab/
+│   └── 🟪 widgets-inc/
+│       ├── 🟨 firmware/
+│       │   └── 🟩 bootloader/
+│       └── 🟨 No Project/
+│           └── 🟩 website/
+├── 🟦 azure-devops/
+│   └── 🟪 contoso/
+│       ├── 🟨 platform/
+│       │   ├── 🟩 billing-service/
+│       │   └── 🟩 identity-service/
+│       └── 🟨 mobile/
+│           └── 🟩 ios-app/
+├── .repoknife.conf
+└── repoknife -> github/floriangrousset/repoknife/repoknife
+```
+
+- 🟦 **provider** — `github` · `gitlab` · `azure-devops`
+- 🟪 **org** — GitHub org or user · GitLab group · Azure DevOps organization
+- 🟨 **project** — the third level: Azure DevOps project · GitLab subgroup (repos without one go in a literal `No Project/` folder)
+- 🟩 **repo** — the git clones themselves
 
 The script finds its Code root automatically (it can live inside a repo and be
 symlinked from the root). Orgs are auto-discovered from folders plus config.
@@ -49,10 +82,11 @@ gh auth login
 # clone + symlink into your code root
 git clone git@github.com:floriangrousset/repoknife.git ~/Code/github/floriangrousset/repoknife
 ln -s github/floriangrousset/repoknife/repoknife ~/Code/repoknife
+cp ~/Code/github/floriangrousset/repoknife/.repoknife.conf ~/Code/  # optional starter config
 
 ~/Code/repoknife            # launch the menu
 ~/Code/repoknife --help     # CLI reference
-~/Code/repoknife _selftest  # 37-check self-diagnostic
+~/Code/repoknife _selftest  # 41-check self-diagnostic
 ```
 
 Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut ·
@@ -62,7 +96,7 @@ Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut 
 
 - Requires **bash ≥ 4.4** (a friendly guard tells you if not)
 - Remote repo lists are cached for 1h in `~/.cache/repoknife` (`--refresh` bypasses)
-- Config lives in `~/Code/.repoknife.conf` — parsed with a strict key allowlist, never sourced
+- Config lives in `~/Code/.repoknife.conf` — parsed with a strict key allowlist, never sourced; a commented starter template with every key ships at the repo root (see Install)
 - Exit codes: `0` ok · `1` usage/deps · `2` auth · `130` cancelled · `health --exit-code` gates CI
 
 ---
