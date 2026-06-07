@@ -1,11 +1,11 @@
 # repoknife — development guide
 
-Single-file bash TUI (`./repoknife`, ~2,250 lines) managing a `~/Code/<provider>/<org>[/<project>]/<repo>` tree. Stack: gum (menus/confirm/spin/style) + fzf (all list pickers) + gh + jq. Deployed via symlink: `~/Code/repoknife → github/floriangrousset/repoknife/repoknife`.
+Single-file bash TUI (`./repoknife`, ~2,250 lines) managing a `~/Code/<provider>/<org>[/<project>]/<repo>` tree (github=2-level · gitlab & azure-devops=3-level — GitLab repos without a subgroup live under a literal `No Project/` dir). Stack: gum (menus/confirm/spin/style) + fzf (all list pickers) + gh + jq. Deployed via symlink: `~/Code/repoknife → github/floriangrousset/repoknife/repoknife`.
 
 ## Verification loop — run after EVERY edit
 
 ```bash
-./repoknife _selftest      # 37 checks, must be 0 failed (fixtures in mktemp, never touches real tree)
+./repoknife _selftest      # 41 checks, must be 0 failed (fixtures in mktemp, never touches real tree)
 shellcheck repoknife       # must be clean (justified disables only, with comment)
 /bin/bash ./repoknife --version   # must print the friendly "requires bash >= 4.4" guard, NOT a syntax error
 ```
@@ -42,4 +42,4 @@ Read-only smokes against the real tree: `./repoknife health --plain`, `sync --or
 
 ## User environment
 
-macOS arm64 (brew bash 5.x, gum 0.17, fzf, gh authed as floriangrousset w/o the `workflow` scope, az present/unauthed), iTerm2 + MesloLGS NF, often ultra-wide terminals — test layout at both 80 and 190 cols. Config: `~/Code/.repoknife.conf` · cache: `~/.cache/repoknife/`.
+macOS arm64 (brew bash 5.x, gum 0.17, fzf, gh authed as floriangrousset w/o the `workflow` scope, az present/unauthed), iTerm2 + MesloLGS NF, often ultra-wide terminals — test layout at both 80 and 190 cols. Config: `~/Code/.repoknife.conf` · cache: `~/.cache/repoknife/` · a starter `.repoknife.conf` template is committed at the repo root — keep its keys in sync with `cfg::is_allowed_key` (selftest-enforced).

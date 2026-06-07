@@ -345,11 +345,13 @@ cfg::set() {  # $1=key $2=value — atomic rewrite preserving other lines
 #============================================================================
 # SECTION 06 — PATH / DISCOVERY  (path::* disco::*)
 #  arity = path components after ~/Code/<provider>/ that identify one repo
-#  github=2 (org/repo) · gitlab=2 (group/repo) · azure-devops=3 (org/project/repo)
+#  github=2 (org/repo) · gitlab=3 (group/project/repo) · azure-devops=3 (org/project/repo)
+#  gitlab "project" = subgroup; repos with none live under a literal "No Project" dir
 #============================================================================
 path::repo_arity() {
   case "$1" in
-    github|gitlab) echo 2 ;;
+    github)        echo 2 ;;
+    gitlab)        echo 3 ;;
     azure-devops)  echo 3 ;;
     *)             echo 0 ;;
   esac
@@ -1831,7 +1833,8 @@ help::page() {
 ${B}  ╠══►  REPOKNIFE${R} ${D}v$VERSION · a git-repos swiss-army-knife · crafted by Florian Grousset${R}
 
 ${H}  CONCEPTS${R}
-    Folder convention   ${D}~/Code/<provider>/<org>/<repo>          (github, gitlab)${R}
+    Folder convention   ${D}~/Code/github/<org>/<repo>${R}
+                        ${D}~/Code/gitlab/<org>/<project>/<repo>      ("No Project" when no subgroup)${R}
                         ${D}~/Code/azure-devops/<org>/<project>/<repo>${R}
     Gitflow defaults    ${D}main + develop · develop is the default branch · feature→develop
                         squash-merge · develop→main merge commit · long-lived branches
@@ -1988,7 +1991,8 @@ cli::help() {
     -h --help          this screen                -V --version    print version
 
   CONVENTIONS
-    ~/Code/<provider>/<org>/<repo>          github/gitlab (2-level)
+    ~/Code/github/<org>/<repo>
+    ~/Code/gitlab/<org>/<project>/<repo>         project = subgroup · "No Project" if none
     ~/Code/azure-devops/<org>/<project>/<repo>   ADO (3-level)
     gitflow: main + develop (develop = default branch)
 
@@ -2140,11 +2144,12 @@ selftest::run() {
            "$fix/github/acme/.hidden/repo" \
            "$fix/azure-devops/corp/Proj/api/.git" \
            "$fix/azure-devops/corp/Proj/scratch" \
-           "$fix/gitlab"
+           "$fix/gitlab/grp/No Project/tool/.git"
   CODE_ROOT="$fix"
 
   # --- path::repo_arity ---
   t::check "arity github" "2" "$(path::repo_arity github)"
+  t::check "arity gitlab" "3" "$(path::repo_arity gitlab)"
   t::check "arity ado" "3" "$(path::repo_arity azure-devops)"
   t::check "arity unknown" "0" "$(path::repo_arity svn)"
 
@@ -2153,10 +2158,14 @@ selftest::run() {
     || t::check "parse gh ok" "rc0" "rc1"
   path::parse "$fix/azure-devops/corp/Proj/api" && t::check "parse ado ok" "azure-devops|corp|Proj|api" "$PROVIDER|$ORG|$PROJECT|$REPO" \
     || t::check "parse ado ok" "rc0" "rc1"
+  path::parse "gitlab/grp/No Project/tool" && t::check "parse gitlab ok (space-safe)" "gitlab|grp|No Project|tool" "$PROVIDER|$ORG|$PROJECT|$REPO" \
+    || t::check "parse gitlab ok (space-safe)" "rc0" "rc1"
   path::parse "github/acme" && t::check "parse org-level rejected" "rc1" "rc0" \
     || t::check "parse org-level rejected" "rc1" "rc1"
   path::parse "azure-devops/corp/Proj" && t::check "parse ado project-level rejected" "rc1" "rc0" \
     || t::check "parse ado project-level rejected" "rc1" "rc1"
+  path::parse "gitlab/grp/tool" && t::check "parse gitlab 2-level rejected" "rc1" "rc0" \
+    || t::check "parse gitlab 2-level rejected" "rc1" "rc1"
   path::parse "github/../escape" && t::check "parse traversal rejected" "rc1" "rc0" \
     || t::check "parse traversal rejected" "rc1" "rc1"
   path::parse "github/acme/.." && t::check "parse dotdot repo rejected" "rc1" "rc0" \
@@ -2184,12 +2193,15 @@ EOF
   cfg::load
   t::check "cfg set+reload" "private" "$(cfg::get default_visibility)"
   t::check "cfg set preserves others" "corp:Proj" "$(cfg::get ado_project_map)"
+  t::check "conf template in sync" \
+    "ado_default_org ado_project_map default_visibility exclude_forks_default extra_orgs_azure-devops extra_orgs_github extra_orgs_gitlab" \
+    "$(grep -Eo '^[a-z_-]+=' "$(dirname "$REPOKNIFE_SELF")/.repoknife.conf" | sed 's/=$//' | sort | tr '\n' ' ' | sed 's/ $//')"
 
   # --- disco ---
   t::check "disco providers" "azure-devops github gitlab" "$(disco::providers | sort | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco orgs union+dedup" "acme other-org" "$(disco::orgs github | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco ado projects" "Proj" "$(disco::ado_projects corp | tr '\n' ' ' | sed 's/ $//')"
-  t::check "disco local repos" "azure-devops/corp/Proj/api github/acme/widget" \
+  t::check "disco local repos" "azure-devops/corp/Proj/api github/acme/widget gitlab/grp/No Project/tool" \
     "$(disco::local_repos | sort | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco init candidates (depth-exact, no dotdirs)" \
     "azure-devops/corp/Proj/scratch github/acme/plainfolder" \
