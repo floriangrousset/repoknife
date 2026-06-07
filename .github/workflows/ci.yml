@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck repoknife
+
+  selftest-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ubuntu-latest ships bash >= 5; git + xargs are present. Network-free.
+      - name: bash version
+        run: bash --version | head -1
+      - name: selftest
+        run: ./repoknife _selftest
+
+  selftest-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # macOS runners ship system bash 3.2 -> install modern bash via brew and
+      # run the selftest under it (the >=4.4 guard would reject /bin/bash).
+      - name: install bash
+        run: brew install bash
+      - name: bash version
+        run: "$(brew --prefix)/bin/bash --version | head -1"
+      - name: selftest (brew bash)
+        run: "$(brew --prefix)/bin/bash ./repoknife _selftest"
+
+  guard-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The friendly bash-3.2 guard MUST fire on system /bin/bash:
+      #   exit 1  AND  stderr contains 'requires bash >= 4.4'
+      - name: bash-3.2 guard fires
+        run: |
+          set +e
+          out="$(/bin/bash ./repoknife --version 2>&1)"
+          rc=$?
+          set -e
+          echo "rc=$rc"
+          echo "$out"
+          if [ "$rc" -ne 1 ]; then
+            echo "FAIL: expected rc 1 from system bash, got $rc" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"requires bash >= 4.4"*) echo "guard OK" ;;
+            *) echo "FAIL: guard message missing 'requires bash >= 4.4'" >&2; exit 1 ;;
+          esac

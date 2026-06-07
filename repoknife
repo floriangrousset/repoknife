@@ -20,7 +20,7 @@ fi
 
 set -Eeuo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 
 # --- self-location (resolves symlinks; CODE_ROOT = dir the script lives in) ---
 SELF="${BASH_SOURCE[0]}"
@@ -2431,6 +2431,12 @@ EOF
   t::check "conf template in sync" \
     "ado_default_org ado_project_map code_root default_visibility exclude_forks_default extra_orgs_azure-devops extra_orgs_github extra_orgs_gitlab" \
     "$(grep -Eo '^[a-z_-]+=' "$(dirname "$REPOKNIFE_SELF")/.repoknife.conf" | sed 's/=$//' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+  # --- release plumbing: VERSION parses (same grep release.yml uses) + guard string present ---
+  t::check "VERSION parses for release" "$VERSION" \
+    "$(grep -E '^VERSION="[0-9]+\.[0-9]+\.[0-9]+"' "$REPOKNIFE_SELF" | head -1 | sed -E 's/^VERSION="([^"]+)".*/\1/')"
+  t::check "bash guard string present" "yes" \
+    "$(grep -q 'requires bash >= 4.4' "$REPOKNIFE_SELF" && echo yes || echo no)"
 
   # --- code_root: path::expand_tilde + cfg::bootstrap resolution ---
   # shellcheck disable=SC2088  # '~' / '~/x' are deliberate literal inputs to the expander under test

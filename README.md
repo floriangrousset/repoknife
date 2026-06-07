@@ -76,20 +76,47 @@ special marker — it's just the folder that holds your `github/` · `gitlab/` �
 
 ## Install
 
+### Homebrew (recommended)
+
 ```bash
-# dependencies
-brew install bash gum fzf jq gh        # macOS (system bash 3.2 is too old)
+brew install floriangrousset/tap/repoknife
 gh auth login
 
-# clone + symlink into your code root
-git clone git@github.com:floriangrousset/repoknife.git ~/Code/github/floriangrousset/repoknife
-ln -s github/floriangrousset/repoknife/repoknife ~/Code/repoknife
-cp ~/Code/github/floriangrousset/repoknife/.repoknife.conf ~/Code/  # optional starter config
-
-~/Code/repoknife            # launch the menu
-~/Code/repoknife --help     # CLI reference
-~/Code/repoknife _selftest  # 41-check self-diagnostic
+repoknife            # launch the menu
+repoknife --help     # CLI reference
 ```
+
+The brew "binary" on your PATH **is** the script (its shebang rewired to the
+brewed bash — no compilation). `brew` pulls in `bash` · `gum` · `fzf` · `jq` ·
+`gh`. Upgrade with `brew upgrade repoknife`.
+
+### A home for your code
+
+repoknife treats `~/Code` like `~/Documents`, `~/Pictures`, `~/Music` — a
+first-class folder where all your repos live, organized by provider/org. The
+code root defaults to `~/Code`; point it elsewhere with the `code_root` config
+key or the `REPOKNIFE_CODE_ROOT` env var.
+
+```bash
+mkdir -p ~/Code
+repoknife config        # set code_root (default ~/Code) and more
+```
+
+Config lives at `~/.repoknife.conf` for the installed binary.
+
+### From source / dev
+
+```bash
+brew install bash gum fzf jq gh
+git clone git@github.com:floriangrousset/repoknife.git ~/Code/github/floriangrousset/repoknife
+cd ~/Code/github/floriangrousset/repoknife
+make install-dev        # symlinks ~/Code/repoknife -> the working tree
+make check              # selftest + shellcheck + bash-3.2 guard
+```
+
+A dev run (`./repoknife`, or the `~/Code/repoknife` symlink) reads the
+repo-adjacent `.repoknife.conf`, keeping dev config separate from your installed
+`~/.repoknife.conf`.
 
 Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut ·
 `gh auth refresh -s workflow` to enable re-running failed Actions jobs.
