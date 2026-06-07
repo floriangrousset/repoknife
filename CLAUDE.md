@@ -33,6 +33,7 @@ Read-only smokes against the real tree: `./repoknife health --plain`, `sync --or
 10. **CODE_ROOT walks UP** from the resolved script path to the first ancestor containing a provider dir (github/azure-devops/gitlab) — works from the symlink and from inside this repo. Override: `REPOKNIFE_CODE_ROOT` (selftest uses it).
 11. **PR merge never passes `--delete-branch`** when head is develop/main/master. Pull is always `--ff-only`; dirty repos are skipped, never autostashed.
 12. **Clone progress**: `git clone --progress` stderr streams to the worker's `.err` file; `batch::render` tails the last CR-separated line. Don't redirect provider clone stderr to /dev/null.
+13. **`fix::` offers prompt only from pre-check sites in the MAIN shell** — never inside `ui::spin`, `$(...)` captures, or worker/batch code (auth logins are interactive foreground programs needing the real TTY). Fix commands are fixed literal allowlists shown verbatim and run via `eval` (justified `SC2294` disable on the line). Rechecks are leaf predicates (`gh auth status`, `ado::auth_ok`, `auth::has_workflow_scope`), NEVER a `*::check` wrapper (recursion guard). Plain mode prints the command and returns the original rc (2 auth · 1 deps). `gum`-missing during `deps::check` uses `fix::offer_dep`'s plain `read -r` (never gum); `brew`-missing points at brew.sh and never installs brew.
 
 ## Testing notes
 

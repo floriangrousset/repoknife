@@ -97,6 +97,7 @@ Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut 
 - Requires **bash ≥ 4.4** (a friendly guard tells you if not)
 - Remote repo lists are cached for 1h in `~/.cache/repoknife` (`--refresh` bypasses)
 - Config lives in `~/Code/.repoknife.conf` — parsed with a strict key allowlist, never sourced; a commented starter template with every key ships at the repo root (see Install)
+- Failure UX: missing tools, an unauthenticated `gh`/`az`, and the workflow-scope gap are detected and **offered as a one-keypress fix** interactively (the exact command is shown verbatim before it runs); in `--plain` mode the copy-paste command is printed and the original exit code preserved
 - Exit codes: `0` ok · `1` usage/deps · `2` auth · `130` cancelled · `health --exit-code` gates CI
 
 ---

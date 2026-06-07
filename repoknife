@@ -596,6 +596,16 @@ ado::auth_ok() {  # never run az interactively inside a spinner — pre-check he
   az account show --only-show-errors >/dev/null 2>&1
 }
 
+ado::ensure_auth() {  # interactive pre-check — call BEFORE any spinner/capture
+  if ! command -v az >/dev/null; then
+    fix::offer "Azure DevOps needs the Azure CLI ('az'), which isn't installed." \
+               "brew install azure-cli" "command -v az" 2 || return 2
+  fi
+  ado::auth_ok && return 0
+  fix::offer "Azure DevOps isn't authenticated. 'az login' opens an interactive sign-in." \
+             "az login" "ado::auth_ok" 2
+}
+
 provider_azure_devops_list_repos() {  # $1=org $2=project
   local org="$1" project="$2"
   if ! ado::auth_ok; then
@@ -622,8 +632,9 @@ provider_azure_devops_repo_url() { printf 'https://dev.azure.com/%s/%s/_git/%s' 
 
 # ------------------------------------------------------------------ gitlab stub
 gitlab::stub() {
-  log::warn "GitLab support is stubbed in v1. Install glab and re-run:"
-  log::info "    brew install glab && glab auth login"
+  # always rc 1 — there is no glab integration yet, even after a confirmed install
+  fix::offer "GitLab support is stubbed in v1 — install glab now to be ready for it." \
+             "brew install glab" "command -v glab" 1 || true
   return 1
 }
 provider_gitlab_list_repos()  { gitlab::stub; }
@@ -1032,6 +1043,7 @@ mod::sync() {
         provider="$SEL"
         if [ "$provider" = "gitlab" ]; then gitlab::stub || true; return 0; fi
         [ "$provider" = "github" ] && { auth::check_gh || return 2; }
+        [ "$provider" = "azure-devops" ] && { ado::ensure_auth || return 2; }
         [ "$SEL_WAS_MENU" -eq 1 ] && NAV+=(provider)
         STEP=org ;;
       org)
@@ -1442,15 +1454,17 @@ mod::pr_actions() {  # $1=number $2=owner/repo
         ;;
       *diff*)   ( gh pr diff "$num" -R "$nwo" --color always | less -R ) || true ;;
       *Approve*)
-        if ui::spin "Approving #$num…" gh pr review "$num" -R "$nwo" --approve; then
+        local aerr
+        if aerr="$(ui::spin "Approving #$num…" gh pr review "$num" -R "$nwo" --approve 2>&1)"; then
           ui::toast ok "approved #$num"
-        else ui::toast err "approve failed"; fi
+        else fix::offer_gh_postmortem "$aerr" "approve failed"; fi
         ;;
       *Merge*)
         if ui::confirm "$stratlabel #$num into $base$delmsg?" "Merge"; then
-          if ui::spin "Merging #$num…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"}; then
+          local merr
+          if merr="$(ui::spin "Merging #$num…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} 2>&1)"; then
             ui::toast ok "merged #$num into $base"; return 0
-          else ui::toast err "merge failed (checks pending / not mergeable?)"; fi
+          else fix::offer_gh_postmortem "$merr" "merge failed (checks pending / not mergeable?)"; fi
         fi
         ;;
       *browser*) gh pr view "$num" -R "$nwo" --web >/dev/null 2>&1 || true ;;
@@ -1479,6 +1493,11 @@ mod::runs() {
   rows="$(printf '%s\n' "${nwos[@]}" | ui::spin "Fetching runs across ${#nwos[@]} repos…" \
           "$SELF" __fanout runs)" || rows=""
   [ -z "$rows" ] && { log::warn "no workflow runs found"; return 0; }
+
+  # per-repo workers can't prompt — surface one auth hint if error rows look auth-related
+  if grep -q '^error	' <<< "$rows" && grep -qiE 'auth|not logged|HTTP 401' <<< "$rows"; then
+    log::warn "some repos failed with auth errors — try: gh auth login"
+  fi
 
   # sort newest first by createdAt (field 6), cap at 40
   # (grep -v exits 1 when it filters EVERYTHING — must not abort under pipefail)
@@ -1528,17 +1547,22 @@ mod::runs_actions() {  # $1=run id $2=owner/repo
           "👁  Watch live" "↻  Re-run failed jobs" "📄  View failure logs" \
           "🌐  Open in browser" "←  Back")" || return 0
     case "$act" in
-      *Watch*)   gh run watch "$id" -R "$nwo" || true ;;
+      *Watch*)   gh run watch "$id" -R "$nwo" || true ;;   # live stream — never capture/spin
       *Re-run*)
         if ! auth::has_workflow_scope; then
-          ui::toast err "token lacks the 'workflow' scope — run: gh auth refresh -s workflow"
-          continue
+          fix::offer "Re-running failed jobs needs the 'workflow' token scope, which your gh token lacks." \
+                     "gh auth refresh -s workflow" "auth::has_workflow_scope" || continue
         fi
         if ui::spin "Re-running failed jobs…" gh run rerun "$id" -R "$nwo" --failed; then
           ui::toast ok "re-run requested"
         else ui::toast err "re-run failed"; fi
         ;;
-      *logs*)    ( gh run view "$id" -R "$nwo" --log-failed | less -R ) || true ;;
+      *logs*)
+        local rlog
+        if rlog="$(gh run view "$id" -R "$nwo" --log-failed 2>&1)"; then
+          printf '%s\n' "$rlog" | less -R
+        else fix::offer_gh_postmortem "$rlog" "could not load failure logs"; fi
+        ;;
       *browser*) gh run view "$id" -R "$nwo" --web >/dev/null 2>&1 || true ;;
       *) return 0 ;;
     esac
@@ -1648,7 +1672,12 @@ mod::health_actions() {  # $1 = repo relpath
           "🦎  Open lazygit" "📋  git status" "⇣  Fetch (with prune)" "⇩  Pull (ff-only)" \
           "✨  Create develop branch" "🧹  Cleanup branches" "←  Back")" || return 0
     case "$act" in
-      *lazygit*)  if command -v lazygit >/dev/null; then ( cd "$dir" && lazygit ); else ui::toast err "lazygit not installed (brew install lazygit)"; fi ;;
+      *lazygit*)
+        if command -v lazygit >/dev/null; then ( cd "$dir" && lazygit )
+        elif fix::offer "lazygit isn't installed — it powers this shortcut." \
+                        "brew install lazygit" "command -v lazygit"; then
+          ( cd "$dir" && lazygit )
+        fi ;;
       *status*)   ( git -C "$dir" -c color.status=always status | less -R ) || true ;;
       *Fetch*)
         if ui::spin "Fetching $rel…" git -C "$dir" fetch --prune; then ui::toast ok "fetched"
@@ -1867,9 +1896,13 @@ ${H}  SCREENS${R}
     🔧 Config           ${D}$CFG_FILE${R}
 
 ${H}  TROUBLESHOOTING${R}
+    Auto-fix            ${D}most failures (missing tools · gh/az not authed · workflow scope)
+                        now ${R}offer to run the fix for you${D} — confirm and it runs · in
+                        --plain mode the exact command is printed instead${R}
     gh not authed       ${D}gh auth login${R}
     Actions re-run 403  ${D}gh auth refresh -s workflow   (token needs the workflow scope)${R}
-    Azure DevOps        ${D}az login   (or az devops login for a PAT)${R}
+    Azure DevOps        ${D}az login   (az missing → brew install azure-cli)${R}
+    Missing tools       ${D}brew install <tool>   (offered on startup)${R}
     Commit signing      ${D}check git config user.signingkey + gpg.format
                         macOS: ssh-add --apple-load-keychain${R}
     Plain mode / CI     ${D}--plain or pipe output · health --exit-code gates CI${R}
@@ -1890,6 +1923,120 @@ mod::help() {
 #============================================================================
 # SECTION 12 — CLI DISPATCH, MENU, CHECKS, SELFTEST, MAIN
 #============================================================================
+#---------------------------------------------------------------- offer-to-fix
+# Graceful failure layer. INVARIANT: only ever called from pre-check sites in
+# the MAIN shell — never inside ui::spin, $(...) captures, or worker/batch code
+# (auth logins are interactive foreground programs that need the real TTY).
+# Fix commands are fixed literal allowlists — never interpolate remote strings.
+
+fix::brew_pkg() {  # $1=tool → brew formula name (az is the only non-1:1)
+  case "$1" in
+    az) printf 'azure-cli' ;;
+    *)  printf '%s' "$1" ;;
+  esac
+}
+
+# Classify captured gh/git stderr into a stable category. PURE — no I/O;
+# selftest drives it with canned strings. First match wins (order matters).
+fix::classify_gh() {  # $1=stderr text → category on stdout
+  case "$1" in
+    *"command not found"*)                       printf 'missing' ;;
+    *"gh auth login"*|*"not logged"*|*"HTTP 401"*|*authentication*) printf 'auth' ;;
+    *"HTTP 403"*workflow*|*workflow*scope*|*"refresh -s workflow"*) printf 'scope' ;;
+    *"API rate limit"*|*"rate limit exceeded"*)  printf 'ratelimit' ;;
+    *"Could not resolve host"*|*"could not resolve host"*|*"connection refused"*|*"network is unreachable"*|*"timed out"*|*"i/o timeout"*) printf 'network' ;;
+    *)                                           printf 'other' ;;
+  esac
+}
+
+fix::gh_hint() {  # $1=category → "diagnosis|fix-cmd" (empty cmd = nothing to offer)
+  case "$1" in
+    missing)   printf 'GitHub CLI is not installed.|brew install gh' ;;
+    auth)      printf 'GitHub CLI is not authenticated.|gh auth login' ;;
+    scope)     printf "Your gh token lacks the 'workflow' scope.|gh auth refresh -s workflow" ;;
+    ratelimit) printf 'GitHub API rate limit hit — wait a bit, or authenticate for a higher limit.|' ;;
+    network)   printf 'Network error reaching GitHub — check your connection.|' ;;
+    *)         printf '|' ;;
+  esac
+}
+
+# Core offer-to-fix. set -e safe: every fallible call is guarded so a failing
+# fix never kills the script.
+#   $1=diagnosis  $2=fix command (fixed literal — shown verbatim AND executed)
+#   $3=recheck command (optional; a leaf predicate, never a *::check wrapper)
+#   $4=rc to return on give-up / plain mode (default 1)
+# Returns 0 when fixed (recheck passes / fix succeeded), else $4.
+fix::offer() {
+  local diag="$1" fixcmd="$2" recheck="${3:-}" rc="${4:-1}"
+  if ! ui::is_interactive; then
+    log::err "$diag"
+    log::info "    fix it with:  $fixcmd"
+    return "$rc"
+  fi
+  ui::box "$C_YELLOW" "$diag" "" "Suggested fix:   $fixcmd"
+  if ! ui::confirm "Run:  $fixcmd  ?" "Run it"; then
+    log::info "    skipped — run it yourself when ready:  $fixcmd"
+    return "$rc"
+  fi
+  # foreground TTY on purpose — auth logins are interactive, never ui::spin
+  local frc=0
+  eval "$fixcmd" || frc=$?
+  if [ "$frc" -ne 0 ]; then
+    ui::toast err "fix command exited $frc — run it manually:  $fixcmd"
+    return "$rc"
+  fi
+  if [ -n "$recheck" ]; then
+    if eval "$recheck" >/dev/null 2>&1; then ui::toast ok "fixed — continuing"; return 0
+    else ui::toast warn "still not resolved — run it manually:  $fixcmd"; return "$rc"; fi
+  fi
+  ui::toast ok "done"
+  return 0
+}
+
+# Dependency installer used by deps::check. Cannot use gum (gum may be the
+# missing tool) — plain read -r y/N. brew missing → point at brew.sh, never
+# install brew itself.
+fix::offer_dep() {  # $1=tool ; rc 0 = present after the offer, 1 = still missing
+  local tool="$1" pkg cmd
+  pkg="$(fix::brew_pkg "$tool")"
+  cmd="brew install $pkg"
+  if ! command -v brew >/dev/null; then
+    log::err "$tool is missing and Homebrew isn't installed."
+    log::info "    install brew first:  https://brew.sh   then:  $cmd"
+    return 1
+  fi
+  if ! ui::is_interactive; then
+    log::err "$tool is not installed."
+    log::info "    install it:  $cmd"
+    return 1
+  fi
+  local ans=""
+  printf '  %s is missing — run "%s" now? [y/N] ' "$tool" "$cmd" >&2
+  read -r ans || true
+  case "$ans" in
+    y|Y|yes|YES) ;;
+    *) log::info "    skipped — install it yourself:  $cmd"; return 1 ;;
+  esac
+  brew install "$pkg" || { log::err "install failed — run it manually:  $cmd"; return 1; }
+  command -v "$tool" >/dev/null
+}
+
+# classify → hint → offer dispatcher for raw gh failures (post-mortem at the
+# few interactive call sites that run gh outside the pre-checked flows).
+fix::offer_gh_postmortem() {  # $1=captured stderr  $2=fallback toast message
+  local cat pair diag cmd
+  cat="$(fix::classify_gh "$1")"
+  pair="$(fix::gh_hint "$cat")"
+  diag="${pair%%|*}"; cmd="${pair#*|}"
+  if [ -z "$cmd" ]; then ui::toast err "${diag:-$2}"; return 1; fi
+  case "$cat" in
+    auth)    fix::offer "$diag" "gh auth login" "gh auth status" 2 ;;
+    missing) fix::offer "$diag" "brew install gh" "command -v gh" 1 ;;
+    scope)   fix::offer "$diag" "gh auth refresh -s workflow" "auth::has_workflow_scope" 2 ;;
+    *)       ui::toast err "${diag:-$2}"; return 1 ;;
+  esac
+}
+
 deps::check() {
   local missing=() t
   for t in fzf jq gh git; do command -v "$t" >/dev/null || missing+=("$t"); done
@@ -1901,16 +2048,21 @@ deps::check() {
   for t in git fzf jq gh gum az; do
     if command -v "$t" >/dev/null; then printf '    %s %s' "$G_OK" "$t" >&2; else printf '    %s %s' "$G_FAIL" "$t" >&2; fi
   done
-  printf '\n\n  Missing: %s\n' "${missing[*]}" >&2
-  if [ "$OS" = "Darwin" ]; then printf '    brew install %s\n\n' "${missing[*]}" >&2
-  else printf '    see install notes (apt/brew) for: %s\n\n' "${missing[*]}" >&2; fi
+  printf '\n\n' >&2
+  # offer each missing tool (plain mode prints the exact command instead)
+  local still=()
+  for t in "${missing[@]}"; do
+    fix::offer_dep "$t" || still+=("$t")
+  done
+  [ "${#still[@]}" -eq 0 ] && return 0
+  log::err "still missing: ${still[*]}"
   exit 1
 }
 
 auth::check_gh() {
   gh auth status >/dev/null 2>&1 && return 0
-  log::err "GitHub CLI is not authenticated. Run: gh auth login   — then retry."
-  return 2
+  fix::offer "GitHub CLI is not authenticated — gh commands will fail. 'gh auth login' opens an interactive sign-in." \
+             "gh auth login" "gh auth status" 2
 }
 
 auth::has_workflow_scope() {
@@ -2210,6 +2362,28 @@ EOF
   # --- provider dispatch ---
   provider::dispatch github bogus_verb 2>/dev/null && t::check "dispatch missing verb" "rc1" "rc0" \
     || t::check "dispatch missing verb" "rc1" "rc1"
+
+  # --- fix:: graceful failure layer (pure logic; interactive paths untestable) ---
+  t::check "fix classify missing"   "missing"   "$(fix::classify_gh 'bash: gh: command not found')"
+  t::check "fix classify auth"      "auth"      "$(fix::classify_gh 'To get started with GitHub CLI, please run: gh auth login')"
+  t::check "fix classify 401"       "auth"      "$(fix::classify_gh 'HTTP 401: Bad credentials')"
+  t::check "fix classify scope"     "scope"     "$(fix::classify_gh 'HTTP 403: token does not have the workflow scope')"
+  t::check "fix classify ratelimit" "ratelimit" "$(fix::classify_gh 'API rate limit exceeded for user')"
+  t::check "fix classify network"   "network"   "$(fix::classify_gh 'fatal: unable to access: Could not resolve host: github.com')"
+  t::check "fix classify other"     "other"     "$(fix::classify_gh 'unexpected end of JSON input')"
+  t::check "fix brew pkg gh"        "gh"        "$(fix::brew_pkg gh)"
+  t::check "fix brew pkg az"        "azure-cli" "$(fix::brew_pkg az)"
+  t::check "fix brew pkg gum"       "gum"       "$(fix::brew_pkg gum)"
+  t::check "fix hint auth cmd"      "gh auth login"                "$(fix::gh_hint auth | cut -d'|' -f2)"
+  t::check "fix hint scope cmd"     "gh auth refresh -s workflow"  "$(fix::gh_hint scope | cut -d'|' -f2)"
+  t::check "fix hint ratelimit no-cmd" ""       "$(fix::gh_hint ratelimit | cut -d'|' -f2)"
+  # plain-mode offer: runs nothing, prints the command, returns the original rc
+  INTERACTIVE=0
+  local fixout fixrc=0
+  fixout="$(fix::offer 'test diag' "touch $fix/should_not_run" '' 7 2>&1)" || fixrc=$?
+  t::check "fix offer plain rc preserved" "7" "$fixrc"
+  t::check "fix offer plain no-run" "absent" "$( [ -e "$fix/should_not_run" ] && echo ran || echo absent )"
+  t::check "fix offer plain prints cmd" "yes" "$(grep -q 'touch ' <<< "$fixout" && echo yes || echo no)"
 
   # --- worker fanout round-trip (xargs + item files preserve tabs) ---
   local fan
