@@ -92,13 +92,27 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: bump homebrew formula
-        uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          formula-name: repoknife
-          formula-path: Formula/repoknife.rb
-          homebrew-tap: floriangrousset/homebrew-tap
-          tag-name: v${{ needs.release.outputs.version }}
-          download-url: https://github.com/floriangrousset/repoknife/archive/refs/tags/v${{ needs.release.outputs.version }}.tar.gz
+      # Plain script instead of a third-party action: deterministic, no Node
+      # deprecation, and avoids the "unexpected HTTP 303" the bump action hit
+      # fetching the tag tarball. Computes the tarball sha256 and rewrites the
+      # formula's url + sha256, then pushes to the tap.
+      - name: bump formula in the tap
         env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          url="https://github.com/floriangrousset/repoknife/archive/refs/tags/$tag.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | awk '{print $1}')"
+          echo "tarball sha256: $sha"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/floriangrousset/homebrew-tap.git" tap
+          cd tap
+          f="Formula/repoknife.rb"
+          sed -i -E "s#^  url \".*\"#  url \"$url\"#" "$f"
+          sed -i -E "s#^  sha256 \".*\"#  sha256 \"$sha\"#" "$f"
+          if git diff --quiet; then echo "formula already at $VERSION — nothing to do"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -aqm "repoknife $VERSION"
+          git push origin HEAD
