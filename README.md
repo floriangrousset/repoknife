@@ -31,13 +31,16 @@ Run bare for the interactive menu, or script it: every module is a subcommand
 
 ## Folder convention
 
+Your **code root** defaults to `~/Code` (override with the `code_root` config key
+or the `REPOKNIFE_CODE_ROOT` env var). Under it, repos are organized by provider:
+
 ```
-~/Code/github/<org>/<repo>
-~/Code/gitlab/<org>/<project>/<repo>        # project = subgroup · "No Project" if none
-~/Code/azure-devops/<org>/<project>/<repo>  # ADO is always 3-level
+<code-root>/github/<org>/<repo>
+<code-root>/gitlab/<org>/<project>/<repo>        # project = subgroup · "No Project" if none
+<code-root>/azure-devops/<org>/<project>/<repo>  # ADO is always 3-level
 ```
 
-For example:
+For example, with the default `~/Code`:
 
 ```
 ~/Code/
@@ -53,15 +56,13 @@ For example:
 │       │   └── 🟩 bootloader/
 │       └── 🟨 No Project/
 │           └── 🟩 website/
-├── 🟦 azure-devops/
-│   └── 🟪 contoso/
-│       ├── 🟨 platform/
-│       │   ├── 🟩 billing-service/
-│       │   └── 🟩 identity-service/
-│       └── 🟨 mobile/
-│           └── 🟩 ios-app/
-├── .repoknife.conf
-└── repoknife -> github/floriangrousset/repoknife/repoknife
+└── 🟦 azure-devops/
+    └── 🟪 contoso/
+        ├── 🟨 platform/
+        │   ├── 🟩 billing-service/
+        │   └── 🟩 identity-service/
+        └── 🟨 mobile/
+            └── 🟩 ios-app/
 ```
 
 - 🟦 **provider** — `github` · `gitlab` · `azure-devops`
@@ -69,8 +70,9 @@ For example:
 - 🟨 **project** — the third level: Azure DevOps project · GitLab subgroup (repos without one go in a literal `No Project/` folder)
 - 🟩 **repo** — the git clones themselves
 
-The script finds its Code root automatically (it can live inside a repo and be
-symlinked from the root). Orgs are auto-discovered from folders plus config.
+Orgs are auto-discovered from these folders plus config. The code root needs no
+special marker — it's just the folder that holds your `github/` · `gitlab/` ·
+`azure-devops/` trees.
 
 ## Install
 
@@ -96,7 +98,8 @@ Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut 
 
 - Requires **bash ≥ 4.4** (a friendly guard tells you if not)
 - Remote repo lists are cached for 1h in `~/.cache/repoknife` (`--refresh` bypasses)
-- Config lives in `~/Code/.repoknife.conf` — parsed with a strict key allowlist, never sourced; a commented starter template with every key ships at the repo root (see Install)
+- Code root: defaults to `~/Code`; set the `code_root` config key or export `REPOKNIFE_CODE_ROOT` to point elsewhere (env wins)
+- Config location: the brew/installed binary reads `~/.repoknife.conf`; a dev run from the clone (`./repoknife`) reads the repo-adjacent `.repoknife.conf` (which doubles as the committed starter template). `REPOKNIFE_CFG_FILE` overrides. Parsed with a strict key allowlist, never sourced. Upgrading from a pre-1.6 layout? `mv ~/Code/.repoknife.conf ~/.repoknife.conf` (or let the first-run prompt move it)
 - Failure UX: missing tools, an unauthenticated `gh`/`az`, and the workflow-scope gap are detected and **offered as a one-keypress fix** interactively (the exact command is shown verbatim before it runs); in `--plain` mode the copy-paste command is printed and the original exit code preserved
 - Exit codes: `0` ok · `1` usage/deps · `2` auth · `130` cancelled · `health --exit-code` gates CI
 

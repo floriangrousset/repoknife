@@ -30,13 +30,18 @@ while [ -h "$SELF" ]; do
   case "$SELF" in /*) : ;; *) SELF="$_dir/$SELF" ;; esac
 done
 SELF="$(cd -P "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
-# CODE_ROOT: the script lives IN a repo (github/floriangrousset/repoknife) and is
-# symlinked from the Code root — walk up from the resolved SELF to the first
-# ancestor that contains a provider directory. Env override wins; old dirname
-# behavior is the fallback.
+# CODE_ROOT — the folder holding your github/ · gitlab/ · azure-devops/ trees.
+# Resolution order: REPOKNIFE_CODE_ROOT env (pinned) > `code_root` config key
+# (applied later in cfg::bootstrap) > walk up from the resolved SELF to the first
+# ancestor containing a provider dir > default ~/Code. The walk-up keeps the
+# dev symlink convenient; the ~/Code default means a brew binary at
+# /opt/homebrew/bin doesn't wrongly anchor itself there.
+# (Keep this block bash-3.2 PARSEABLE — it runs above the >=4.4 features.)
 if [ -n "${REPOKNIFE_CODE_ROOT:-}" ]; then
   CODE_ROOT="$REPOKNIFE_CODE_ROOT"
+  REPOKNIFE_ROOT_PINNED=1
 else
+  REPOKNIFE_ROOT_PINNED=0
   CODE_ROOT=""
   _probe="$(dirname "$SELF")"
   while [ "$_probe" != "/" ]; do
@@ -46,7 +51,7 @@ else
     fi
     _probe="$(dirname "$_probe")"
   done
-  [ -z "$CODE_ROOT" ] && CODE_ROOT="$(dirname "$SELF")"
+  [ -z "$CODE_ROOT" ] && CODE_ROOT="$HOME/Code"
   unset _probe
 fi
 export REPOKNIFE_SELF="$SELF"
@@ -54,7 +59,16 @@ export REPOKNIFE_SELF="$SELF"
 #============================================================================
 # SECTION 02 — CONSTANTS & GLOBALS
 #============================================================================
-CFG_FILE="${REPOKNIFE_CFG_FILE:-$CODE_ROOT/.repoknife.conf}"
+# CFG_FILE — script-adjacent config when running from a clone (the committed
+# .repoknife.conf is the dev config), else the user-level ~/.repoknife.conf
+# (brew / any installed copy). REPOKNIFE_CFG_FILE pins it explicitly.
+if [ -n "${REPOKNIFE_CFG_FILE:-}" ]; then
+  CFG_FILE="$REPOKNIFE_CFG_FILE"
+elif [ -f "$(dirname "$SELF")/.repoknife.conf" ]; then
+  CFG_FILE="$(dirname "$SELF")/.repoknife.conf"
+else
+  CFG_FILE="$HOME/.repoknife.conf"
+fi
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/repoknife"
 CACHE_TTL="${REPOKNIFE_CACHE_TTL:-3600}"   # seconds
 JOBS="${REPOKNIFE_JOBS:-8}"
@@ -297,7 +311,8 @@ declare -A CFG=()
 cfg::is_allowed_key() {
   case "$1" in
     extra_orgs_github|extra_orgs_gitlab|extra_orgs_azure-devops\
-    |ado_default_org|ado_project_map|default_visibility|exclude_forks_default)
+    |ado_default_org|ado_project_map|default_visibility|exclude_forks_default\
+    |code_root)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -342,6 +357,45 @@ cfg::set() {  # $1=key $2=value — atomic rewrite preserving other lines
   CFG["$key"]="$val"
 }
 
+cfg::bootstrap() {  # after cfg::load: honor code_root (env pin wins), export for children
+  if [ "${REPOKNIFE_ROOT_PINNED:-0}" -eq 0 ]; then
+    local want; want="$(path::expand_tilde "$(cfg::get code_root)")"
+    [ -n "$want" ] && CODE_ROOT="$want"
+  fi
+  export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # final — workers/spinner children inherit this
+}
+
+cfg::firstrun() {  # cold-start: offer to pick/create a code root, or migrate old config
+  [ -f "$CFG_FILE" ] && return 0
+  # migrate the pre-1.6 location (config used to live at <code-root>/.repoknife.conf)
+  local legacy="$HOME/Code/.repoknife.conf"
+  if [ -f "$legacy" ] && [ "$legacy" != "$CFG_FILE" ]; then
+    if ! ui::is_interactive; then
+      log::info "hint: move your config to the new location:  mv $legacy $CFG_FILE"
+      return 0
+    fi
+    if ui::confirm "Found an old config at $legacy — move it to $CFG_FILE?" "Move it"; then
+      mv "$legacy" "$CFG_FILE" && { cfg::load; cfg::bootstrap; ui::toast ok "config moved to $CFG_FILE"; }
+    fi
+    return 0
+  fi
+  # nothing to migrate — if the resolved root already has provider trees, stay quiet
+  { [ -d "$CODE_ROOT/github" ] || [ -d "$CODE_ROOT/gitlab" ] || [ -d "$CODE_ROOT/azure-devops" ]; } && return 0
+  if ! ui::is_interactive; then
+    log::info "hint: no code root found — set one with 'repoknife config' (key: code_root, default ~/Code)"
+    return 0
+  fi
+  local def="$HOME/Code" pick exp
+  pick="$(ui::input "Where do your repos live? (code root)" "$def")" || return 0
+  [ -z "$pick" ] && pick="$def"
+  exp="$(path::expand_tilde "$pick")"
+  ui::confirm "Use $exp as your code root?" "Use it" || return 0
+  mkdir -p "$exp" || { ui::toast err "could not create $exp"; return 0; }
+  CODE_ROOT="$exp"; export REPOKNIFE_CODE_ROOT="$CODE_ROOT"
+  cfg::set code_root "$pick"   # stores the literal value (~ preserved); creates CFG_FILE
+  ui::toast ok "code root set: $exp"
+}
+
 #============================================================================
 # SECTION 06 — PATH / DISCOVERY  (path::* disco::*)
 #  arity = path components after ~/Code/<provider>/ that identify one repo
@@ -383,6 +437,16 @@ path::parse() {
 path::repo_dir() {  # $1=provider $2=org $3=project(or "") $4=repo → abs path
   if [ -n "$3" ]; then printf '%s/%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$3" "$4"
   else printf '%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$4"; fi
+}
+
+path::expand_tilde() {  # $1=value; expand a leading ~ / ~/ to $HOME (no eval, no glob)
+  local v="$1"
+  # shellcheck disable=SC2088  # "~" patterns are literal match targets here, not paths to expand
+  case "$v" in
+    "~")   printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${v:2}" ;;   # drop the matched "~/"
+    *)     printf '%s' "$v" ;;
+  esac
 }
 
 disco::providers() {  # providers that exist as folders
@@ -1821,7 +1885,7 @@ mod::config() {
   if [ "$sub" = "list" ] || ! ui::is_interactive; then
     log::info "config file: $CFG_FILE"
     local k
-    for k in extra_orgs_github extra_orgs_gitlab extra_orgs_azure-devops \
+    for k in code_root extra_orgs_github extra_orgs_gitlab extra_orgs_azure-devops \
              ado_default_org ado_project_map default_visibility exclude_forks_default; do
       printf '  %-26s = %s\n' "$k" "$(cfg::get "$k" "(unset)")"
     done
@@ -1829,23 +1893,36 @@ mod::config() {
   fi
   while :; do
     local key val
-    ui::page "Config" "orgs not yet cloned · ADO org:project map · repo-create visibility · fork filter" "$CFG_FILE"
+    ui::page "Config" "code root · orgs not yet cloned · ADO org:project map · repo-create visibility · fork filter" "$CFG_FILE"
     key="$(ui::menu "🔧 config · $CFG_FILE" \
-          "extra_orgs_github" "extra_orgs_azure-devops" "extra_orgs_gitlab" \
+          "code_root" "extra_orgs_github" "extra_orgs_azure-devops" "extra_orgs_gitlab" \
           "ado_default_org" "ado_project_map" "default_visibility" \
           "exclude_forks_default" "📄  show all" "←  Back")" || return 0
     case "$key" in
       *show*) mod::config list; ui::is_interactive && { printf '  (enter to continue) '; read -r; } ;;
       *Back*) return 0 ;;
       *)
-        val="$(ui::input "$key (current: $(cfg::get "$key" "unset"))" \
-              "$( [ "$key" = default_visibility ] && echo 'private|public' || echo 'comma-separated / org:project' )")" || continue
+        local ph='comma-separated / org:project'
+        # shellcheck disable=SC2088  # 'code_root' placeholder is literal hint text — ~ never expands
+        case "$key" in
+          default_visibility) ph='private|public' ;;
+          code_root)          ph='~/Code' ;;
+        esac
+        val="$(ui::input "$key (current: $(cfg::get "$key" "unset"))" "$ph")" || continue
         [ -z "$val" ] && continue
         if [ "$key" = "default_visibility" ] && [ "$val" != private ] && [ "$val" != public ]; then
           ui::toast err "must be 'private' or 'public'"; continue
         fi
         if [ "$key" = "exclude_forks_default" ] && [ "$val" != true ] && [ "$val" != false ]; then
           ui::toast err "must be 'true' or 'false'"; continue
+        fi
+        if [ "$key" = "code_root" ]; then
+          local exp; exp="$(path::expand_tilde "$val")"
+          if [ ! -d "$exp" ]; then
+            if ui::confirm "$exp does not exist — create it?" "Create"; then
+              mkdir -p "$exp" || { ui::toast err "could not create $exp"; continue; }
+            else ui::toast warn "code_root not changed"; continue; fi
+          fi
         fi
         cfg::set "$key" "$val"
         ui::toast ok "$key = $val"
@@ -1868,6 +1945,8 @@ ${H}  CONCEPTS${R}
     Gitflow defaults    ${D}main + develop · develop is the default branch · feature→develop
                         squash-merge · develop→main merge commit · long-lived branches
                         are never auto-deleted${R}
+    Code root           ${D}~/Code by default · set via config code_root · REPOKNIFE_CODE_ROOT env wins${R}
+    Config file         ${D}~/.repoknife.conf (installed) · the repo-adjacent .repoknife.conf (dev runs)${R}
     Orgs                ${D}auto-discovered from folders ∪ config extra_orgs_* keys${R}
     Cache               ${D}remote repo lists cached 1h in ~/.cache/repoknife — bypass with --refresh${R}
 
@@ -2143,9 +2222,11 @@ cli::help() {
     -h --help          this screen                -V --version    print version
 
   CONVENTIONS
-    ~/Code/github/<org>/<repo>
-    ~/Code/gitlab/<org>/<project>/<repo>         project = subgroup · "No Project" if none
-    ~/Code/azure-devops/<org>/<project>/<repo>   ADO (3-level)
+    <code-root>/github/<org>/<repo>
+    <code-root>/gitlab/<org>/<project>/<repo>         project = subgroup · "No Project" if none
+    <code-root>/azure-devops/<org>/<project>/<repo>   ADO (3-level)
+    code root: ~/Code by default · config code_root · REPOKNIFE_CODE_ROOT env wins
+    config:    ~/.repoknife.conf (installed) · repo-adjacent .repoknife.conf (dev runs)
     gitflow: main + develop (develop = default branch)
 
   DEPS  gum · fzf · jq · gh · git   (az optional, for Azure DevOps)
@@ -2227,7 +2308,7 @@ cli::__preview() {
       size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
       printf '%s%s%s\n' "$A_BOLD" "$(basename "$rel")" "$A_RST"
       printf '%s%s%s\n\n' "$A_FAINT" "──────────────────────────────────────" "$A_RST"
-      printf '  %spath%s    ~/Code/%s\n' "$A_DIM" "$A_RST" "$rel"
+      printf '  %spath%s    %s/%s\n' "$A_DIM" "$A_RST" "$CODE_ROOT" "$rel"
       printf '  %sfiles%s   %s files · %s\n' "$A_DIM" "$A_RST" "$files" "$size"
       printf '  %sinfer%s   org = %s (%s)\n' "$A_DIM" "$A_RST" "$ORG" "$PROVIDER"
       if [ "$PROVIDER" = "github" ]; then
@@ -2245,8 +2326,8 @@ cli::dispatch() {
   case "$CMD" in
     # --- hidden fast-paths: no banner/deps/auth cost --------------------------
     _worker)        PLAIN=1; palette::init; worker::entry "${CMD_ARGS[@]}"; exit 0 ;;
-    __list)         palette::init; cfg::load; cli::__list "${CMD_ARGS[@]}"; exit $? ;;
-    __fanout)       palette::init; cfg::load; cli::__fanout "${CMD_ARGS[@]}"; exit $? ;;
+    __list)         palette::init; cfg::load; cfg::bootstrap; cli::__list "${CMD_ARGS[@]}"; exit $? ;;
+    __fanout)       palette::init; cfg::load; cfg::bootstrap; cli::__fanout "${CMD_ARGS[@]}"; exit $? ;;
     __initscan)     palette::init; disco::init_candidates; exit 0 ;;
     __prfetch)      pr::fetch "${CMD_ARGS[0]:-all}"; exit $? ;;
     __preview)      cli::__preview "${CMD_ARGS[@]}"; exit 0 ;;
@@ -2263,6 +2344,8 @@ cli::dispatch() {
   palette::init
   deps::check
   cfg::load
+  cfg::bootstrap
+  cfg::firstrun
   [ "$(cfg::get exclude_forks_default)" = "true" ] && EXCLUDE_FORKS=1
 
   case "$CMD" in
@@ -2346,8 +2429,38 @@ EOF
   t::check "cfg set+reload" "private" "$(cfg::get default_visibility)"
   t::check "cfg set preserves others" "corp:Proj" "$(cfg::get ado_project_map)"
   t::check "conf template in sync" \
-    "ado_default_org ado_project_map default_visibility exclude_forks_default extra_orgs_azure-devops extra_orgs_github extra_orgs_gitlab" \
+    "ado_default_org ado_project_map code_root default_visibility exclude_forks_default extra_orgs_azure-devops extra_orgs_github extra_orgs_gitlab" \
     "$(grep -Eo '^[a-z_-]+=' "$(dirname "$REPOKNIFE_SELF")/.repoknife.conf" | sed 's/=$//' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+  # --- code_root: path::expand_tilde + cfg::bootstrap resolution ---
+  # shellcheck disable=SC2088  # '~' / '~/x' are deliberate literal inputs to the expander under test
+  t::check "expand_tilde bare"    "$HOME"     "$(path::expand_tilde '~')"
+  # shellcheck disable=SC2088  # ditto — literal test input
+  t::check "expand_tilde slash"   "$HOME/x"   "$(path::expand_tilde '~/x')"
+  t::check "expand_tilde literal" "/abs/p"    "$(path::expand_tilde '/abs/p')"
+  # bootstrap re-points CODE_ROOT from the code_root key (env not pinned)
+  local r2="$fix/alt"; mkdir -p "$r2"
+  CODE_ROOT="$fix"; CFG_FILE="$fix/rk.conf"; REPOKNIFE_ROOT_PINNED=0
+  printf 'code_root=%s\n' "$r2" > "$CFG_FILE"
+  cfg::load; cfg::bootstrap
+  t::check "bootstrap re-points root" "$r2" "$CODE_ROOT"
+  # env-pin wins over config code_root
+  CODE_ROOT="$fix"; CFG_FILE="$fix/rk.conf"; REPOKNIFE_ROOT_PINNED=1
+  printf 'code_root=%s\n' "$r2" > "$CFG_FILE"
+  cfg::load; cfg::bootstrap
+  t::check "bootstrap env-pin wins" "$fix" "$CODE_ROOT"
+  # ~ in a code_root value expands (assert CODE_ROOT only — never load a real ~/.repoknife.conf)
+  CODE_ROOT="$fix"; CFG_FILE="$fix/rk.conf"; REPOKNIFE_ROOT_PINNED=0
+  printf 'code_root=~\n' > "$CFG_FILE"
+  cfg::load; cfg::bootstrap
+  t::check "bootstrap ~ expands" "$HOME" "$CODE_ROOT"
+  # empty/absent code_root leaves the current root untouched
+  CODE_ROOT="$fix"; CFG_FILE="$fix/rk.conf"; REPOKNIFE_ROOT_PINNED=0
+  printf 'default_visibility=private\n' > "$CFG_FILE"
+  cfg::load; cfg::bootstrap
+  t::check "bootstrap no code_root keeps root" "$fix" "$CODE_ROOT"
+  # restore fixture globals for the checks that follow
+  CODE_ROOT="$fix"; CFG_FILE="$fix/test.conf"; REPOKNIFE_ROOT_PINNED=0; cfg::load 2>/dev/null
 
   # --- disco ---
   t::check "disco providers" "azure-devops github gitlab" "$(disco::providers | sort | tr '\n' ' ' | sed 's/ $//')"
