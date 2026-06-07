@@ -72,6 +72,11 @@ fi
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/repoknife"
 CACHE_TTL="${REPOKNIFE_CACHE_TTL:-3600}"   # seconds
 JOBS="${REPOKNIFE_JOBS:-8}"
+# a bad REPOKNIFE_JOBS must degrade loudly to the default — not silently break the
+# run (non-numeric → xargs errors → swallowed → empty result) or fork-bomb a large
+# tree (0 means "as many as possible" to xargs). Reset non-positive-int, clamp high.
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || JOBS=8
+[ "$JOBS" -gt 64 ] && JOBS=64
 OS="$(uname -s)"
 
 PROVIDERS=(github azure-devops gitlab)
@@ -81,11 +86,16 @@ PROVIDERS=(github azure-devops gitlab)
 # there even on a real terminal, which is exactly how menus get captured.
 INTERACTIVE=0
 
-# mutable run-state flags (set by cli::parse_args; env-inheritable so the
-# hidden _worker children see the parent's --dry-run / fork filter)
+# mutable run-state flags (set by cli::parse_args). Exported HERE so every
+# re-exec child — the hidden _worker/__list/__fanout fast-paths — inherits the
+# parent's --plain / --dry-run / fork filter. The export attribute survives the
+# later re-assignments in cli::parse_args and cfg bootstrap, so a single export
+# at definition is enough (and is the one place that guarantees __list, which
+# reads EXCLUDE_FORKS for `gh repo list --source`, sees the right value).
 PLAIN="${PLAIN:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 EXCLUDE_FORKS="${EXCLUDE_FORKS:-0}"
+export PLAIN DRY_RUN EXCLUDE_FORKS
 USE_EXIT_CODE=0
 REFRESH=0
 ALL=0
@@ -94,9 +104,13 @@ ARG_PROVIDER=""
 CMD=""
 CMD_ARGS=()
 
-# temp-dir registry for the cleanup trap
+# per-process temp ROOT — every tmp::dir is created beneath it, so the cleanup
+# trap reaps them all with one rm -rf keyed on $$ (deterministic, and identical
+# in subshells). This replaces a registry array that was effectively dead:
+# tmp::dir is always called via $(...), so any array append happened in the
+# command-substitution subshell and was lost — the trap then deleted nothing.
 # (partial-clone cleanup is handled IN the worker; git clone removes its own dir on SIGINT)
-TMP_REGISTRY=()
+RK_TMP_ROOT="${TMPDIR:-/tmp}/repoknife.$$"
 
 color::enabled() {
   # fzf preview panes render ANSI but aren't TTYs — parent sets FORCE_COLOR
@@ -143,10 +157,11 @@ log::err()  { printf '%s%s %s%s\n' "$A_REDX" "$G_FAIL" "$*" "$A_RST" >&2; }
 log::die()  { log::err "$@"; exit 1; }
 
 cleanup::run() {
-  local d
-  for d in ${TMP_REGISTRY[@]+"${TMP_REGISTRY[@]}"}; do
-    [ -n "$d" ] && rm -rf "$d"
-  done
+  # at-most-once: the INT handler runs this, then re-raises INT which fires the
+  # EXIT trap → this again. Guard so it's safe regardless of which trap fires.
+  [ -n "${RK_CLEANED:-}" ] && return 0
+  RK_CLEANED=1
+  rm -rf "$RK_TMP_ROOT" 2>/dev/null || true   # one rm reaps every tmp::dir
   if [ -t 1 ]; then
     printf '\033[?7h\033[?25h' 2>/dev/null || true   # restore autowrap + cursor
     tput cnorm 2>/dev/null || true
@@ -156,11 +171,9 @@ trap cleanup::run EXIT
 trap 'cleanup::run; trap - INT; kill -INT $$' INT
 trap 'cleanup::run' TERM
 
-tmp::dir() {  # mktemp -d, registered for cleanup
-  local d
-  d="$(mktemp -d "${TMPDIR:-/tmp}/repoknife.XXXXXX")"
-  TMP_REGISTRY+=("$d")
-  printf '%s' "$d"
+tmp::dir() {  # mktemp -d beneath RK_TMP_ROOT; cleanup::run reaps the root wholesale
+  mkdir -p "$RK_TMP_ROOT" && chmod 700 "$RK_TMP_ROOT"
+  mktemp -d "$RK_TMP_ROOT/XXXXXX"
 }
 
 #============================================================================
@@ -767,7 +780,7 @@ worker::fanout() {  # $1=verb ; items on stdin (one per line) ; merged TSV on st
   outdir="$(tmp::dir)"
   n="$(worker::write_items "$outdir")"
   [ "$n" -eq 0 ] && return 0
-  export REPOKNIFE_CODE_ROOT="$CODE_ROOT" DRY_RUN EXCLUDE_FORKS
+  export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # DRY_RUN/EXCLUDE_FORKS exported once at top
   seq 0 $((n-1)) | xargs -P "$JOBS" -I{} "$SELF" _worker "$verb" "$outdir" {} >/dev/null 2>&1 || true
   local j=0
   while [ "$j" -lt "$n" ]; do cat "$outdir/$j.out" 2>/dev/null || true; j=$((j+1)); done
@@ -909,7 +922,7 @@ batch::run() {  # $1 = worker verb
   BATCH_RESULTS=()
   [ "$n" -eq 0 ] && return 0
   outdir="$(tmp::dir)"
-  export REPOKNIFE_CODE_ROOT="$CODE_ROOT" DRY_RUN EXCLUDE_FORKS
+  export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # DRY_RUN/EXCLUDE_FORKS exported once at top
   printf '%s\n' "${BATCH_ITEMS[@]}" | worker::write_items "$outdir" >/dev/null
   seq 0 $((n-1)) \
     | xargs -P "$JOBS" -I{} "$SELF" _worker "$verb" "$outdir" {} >/dev/null 2>&1 &
@@ -1111,6 +1124,8 @@ mod::sync() {
         [ "$SEL_WAS_MENU" -eq 1 ] && NAV+=(provider)
         STEP=org ;;
       org)
+        # azure-devops: an unset org falls back to the configured default (if any)
+        [ -z "$arg_org" ] && [ "$provider" = azure-devops ] && arg_org="$(cfg::get ado_default_org)"
         if [ -n "$arg_org" ]; then org="$arg_org"
         else
           if ! mod::pick_org "$provider"; then nav::pop && continue; return 0; fi
@@ -1565,7 +1580,7 @@ mod::runs() {
 
   # sort newest first by createdAt (field 6), cap at 40
   # (grep -v exits 1 when it filters EVERYTHING — must not abort under pipefail)
-  rows="$(sort -t$'\t' -k6,6r <<< "$rows" | grep -v '^error	' | head -40 || true)"
+  rows="$(LC_ALL=C sort -t$'\t' -k6,6r <<< "$rows" | grep -v '^error	' | head -40 || true)"
 
   local cols repow wfw brw
   cols=$(ui::cols)
@@ -1641,7 +1656,7 @@ mod::health() {
 
   local rows
   rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${#repos[@]} repos…" "$SELF" __fanout status)"
-  rows="$(sort -t$'\t' -k9,9n -k1,1 <<< "$rows")"
+  rows="$(LC_ALL=C sort -t$'\t' -k9,9n -k1,1 <<< "$rows")"   # C locale: byte-deterministic, BSD/GNU-identical, broken-locale-safe
 
   # counts
   local dirty=0 unpushed=0 behind=0 nodev=0 gone=0 attention=0 total=0
@@ -1899,7 +1914,7 @@ mod::config() {
           "ado_default_org" "ado_project_map" "default_visibility" \
           "exclude_forks_default" "📄  show all" "←  Back")" || return 0
     case "$key" in
-      *show*) mod::config list; ui::is_interactive && { printf '  (enter to continue) '; read -r; } ;;
+      *show*) mod::config list; ui::is_interactive && { printf '  (enter to continue) '; read -r || true; } ;;
       *Back*) return 0 ;;
       *)
         local ph='comma-separated / org:project'
@@ -2209,7 +2224,7 @@ cli::help() {
     pr       [scope]              PR dashboard · scope: all·mine·review·assigned·mentions
     runs     [org]                workflow runs · watch · rerun failed
     health                        scan every local repo for problems
-    cleanup  [provider/org/repo]  prune gone/merged branches · sync develop
+    cleanup  [repo-path]          prune gone/merged branches · sync develop
     config   [list]               orgs · ADO defaults · fork filter
 
   FLAGS
@@ -2508,6 +2523,14 @@ EOF
   local fan
   fan="$(DRY_RUN=1 worker::fanout syncitem <<< $'pull\tgithub/acme/widget')"
   t::check "fanout tab round-trip" "ok	github/acme/widget	DRY: would pull" "$fan"
+
+  # --- run-state flags exported so re-exec children (__list) inherit them (--no-forks fix) ---
+  t::check "exclude_forks exported" "yes" "$(declare -p EXCLUDE_FORKS 2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+  t::check "plain exported"         "yes" "$(declare -p PLAIN         2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+  t::check "dry_run exported"       "yes" "$(declare -p DRY_RUN       2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+
+  # --- tmp::dir lives beneath the per-process root so the cleanup trap can reap it ---
+  t::check "tmp dir under root" "yes" "$(d="$(tmp::dir)"; case "$d" in "$RK_TMP_ROOT"/*) echo yes ;; *) echo no ;; esac)"
 
   # --- cli args (safe to mutate globals: selftest exits right after) ---
   cli::parse_args --org acme sync --no-forks --dry-run extra
