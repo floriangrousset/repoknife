@@ -6,3 +6,9 @@
 
 # macOS
 .DS_Store
+
+# build artifacts (make build)
+dist/
+
+# staging for the separate floriangrousset/homebrew-tap repo (not part of this repo)
+dist-tap/
