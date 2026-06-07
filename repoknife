@@ -276,7 +276,7 @@ ui::toast() {  # $1 = ok|warn|err, $2.. = message
     warn) log::warn "$@" ;;
     *)    log::err "$@" ;;
   esac
-  ui::is_interactive && sleep 0.7 || true
+  if ui::is_interactive; then sleep 0.7 || true; fi
 }
 
 ui::trunc() {  # $1=str $2=maxlen — right-ellipsis
