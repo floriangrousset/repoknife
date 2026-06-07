@@ -1,0 +1,8 @@
+# Claude Code plugin state (remember plugin logs)
+.remember/
+
+# local Claude settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store
