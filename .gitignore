@@ -10,5 +10,9 @@
 # build artifacts (make build)
 dist/
 
+# transient release-notes scratch produced by the release workflow
+RELEASE_BODY.md
+NOTES.md
+
 # staging for the separate floriangrousset/homebrew-tap repo (not part of this repo)
 dist-tap/
