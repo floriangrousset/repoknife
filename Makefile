@@ -6,7 +6,7 @@ SYMLINK   := $(CODE_ROOT)/repoknife
 DISTBIN   := dist/repoknife
 
 .DEFAULT_GOAL := help
-.PHONY: help check selftest shellcheck guard build install-dev install-brew-local release-dry-run clean
+.PHONY: help check selftest shellcheck guard build install-dev install-brew-local changelog version release-dry-run clean
 
 help: ## list targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -41,11 +41,23 @@ install-brew-local: build ## (re)install from the tap formula, build from source
 	brew install --build-from-source floriangrousset/tap/repoknife \
 	  || brew reinstall floriangrousset/tap/repoknife
 
-release-dry-run: check build ## everything release.yml does except push/tag/release
-	@echo "would create tag v$(VERSION) + release with:"; ls -l dist
-	@git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null \
-	  && echo "WARNING: tag v$(VERSION) already exists (release would no-op)" \
-	  || echo "tag v$(VERSION) is free"
+changelog: ## preview the changelog for the unreleased commits (needs git-cliff)
+	@command -v git-cliff >/dev/null || { echo "git-cliff not installed — brew install git-cliff"; exit 1; }
+	@git-cliff --unreleased --bump --strip header
+
+version: ## show the last-released VERSION and the next version git-cliff would compute
+	@echo "VERSION (last release): $(VERSION)"
+	@command -v git-cliff >/dev/null \
+	  && echo "next (computed):        $$(git-cliff --bumped-version 2>/dev/null)" \
+	  || echo "next (computed):        (install git-cliff to compute)"
+
+release-dry-run: check ## what release.yml will do on the next develop->main merge (no push/tag)
+	@command -v git-cliff >/dev/null || { echo "git-cliff not installed — brew install git-cliff"; exit 1; }
+	@next="$$(git-cliff --bumped-version 2>/dev/null)"; \
+	  last="$$(git describe --tags --abbrev=0 2>/dev/null || echo none)"; \
+	  echo "last tag: $$last   next: $$next"; \
+	  if [ "$$next" = "$$last" ]; then echo "no releasable commits — release would no-op"; \
+	  else echo "release would: set VERSION=$${next#v}, regenerate CHANGELOG.md, tag $$next, publish, bump tap"; fi
 
 clean: ## remove dist/
 	rm -rf dist

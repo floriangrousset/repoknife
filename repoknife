@@ -2284,6 +2284,21 @@ menu::loop() {
   done
 }
 
+ver::print() {  # `--version`: always "repoknife X.Y.Z" (line 1, kept stable for the
+  # brew formula test); on a dev checkout add a build line so an unreleased local
+  # copy can't masquerade as the last release. VERSION is the last RELEASED version;
+  # the release pipeline bumps it automatically — git describe shows how far ahead.
+  printf 'repoknife %s\n' "$VERSION"
+  command -v git >/dev/null || return 0
+  local dir desc br
+  dir="$(dirname "$SELF")"
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  desc="$(git -C "$dir" describe --tags --always --dirty 2>/dev/null || true)"
+  br="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$desc" ] && printf '  build  %s%s\n' "$desc" "${br:+ · $br}"
+  return 0   # never let the trailing && be the failing leaf (set -e would abort --version)
+}
+
 cli::help() {
   cat <<EOF
 
@@ -2337,7 +2352,7 @@ cli::parse_args() {
       --org=*)            ARG_ORG="${1#*=}" ;;
       --provider)         ARG_PROVIDER="${2:?--provider needs a value}"; shift ;;
       --provider=*)       ARG_PROVIDER="${1#*=}" ;;
-      -V|--version)       printf 'repoknife %s\n' "$VERSION"; exit 0 ;;
+      -V|--version)       ver::print; exit 0 ;;
       -h|--help)          CMD=help; return 0 ;;
       --)                 shift; args+=("$@"); break ;;
       -*)                 printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 1 ;;
@@ -2601,6 +2616,8 @@ EOF
   t::check "age relative 2h"   "2h"   "$(ui::age "$(( $(date +%s) - 7200 ))")"
   t::check "strip_ansi OSC"    "X"    "$(printf '\033]0;pwn\007X' | ui::strip_ansi)"
   t::check "strip_ansi CSI"    "red"  "$(printf '\033[31mred\033[0m' | ui::strip_ansi)"
+  # --version line 1 must stay exactly "repoknife X.Y.Z" (the brew formula test asserts it)
+  t::check "version line shape" "yes" "$(v="$(ver::print)"; v="${v%%$'\n'*}"; [[ "$v" =~ ^repoknife[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] && echo yes || echo no)"
 
   # --- cache::file sanitization: config-supplied org/project must not escape CACHE_DIR ---
   t::check "cache key slash to _"   "$fix/c/github__a_b_c__x.tsv"   "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github 'a/b/c' 'x')"
