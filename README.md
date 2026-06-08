@@ -128,7 +128,8 @@ Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut 
 - Code root: defaults to `~/Code`; set the `code_root` config key or export `REPOKNIFE_CODE_ROOT` to point elsewhere (env wins)
 - Config location: the brew/installed binary reads `~/.repoknife.conf`; a dev run from the clone (`./repoknife`) reads the repo-adjacent `.repoknife.conf` (which doubles as the committed starter template). `REPOKNIFE_CFG_FILE` overrides. Parsed with a strict key allowlist, never sourced. Upgrading from a pre-1.6 layout? `mv ~/Code/.repoknife.conf ~/.repoknife.conf` (or let the first-run prompt move it)
 - Failure UX: missing tools, an unauthenticated `gh`/`az`, and the workflow-scope gap are detected and **offered as a one-keypress fix** interactively (the exact command is shown verbatim before it runs); in `--plain` mode the copy-paste command is printed and the original exit code preserved
-- Exit codes: `0` ok · `1` usage/deps · `2` auth · `130` cancelled · `health --exit-code` gates CI
+- Exit codes: `0` ok · `1` usage/deps · `2` auth · `130` cancelled (sync; other interactive screens return `0` on ESC) · `health --exit-code` exits with the attention count to gate CI
+- Versioning & changelog: automatic [SemVer](https://semver.org) derived from [Conventional Commits](https://www.conventionalcommits.org) — every release is cut and the [CHANGELOG](CHANGELOG.md) is regenerated automatically (via [git-cliff](https://git-cliff.org)). `repoknife --version` reports the released version; a dev checkout also prints its `git describe` build line
 
 ---
 crafted by **Florian Grousset**

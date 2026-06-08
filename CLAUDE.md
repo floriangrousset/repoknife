@@ -5,7 +5,7 @@ Single-file bash TUI (`./repoknife`, ~2,400 lines) managing a `<code-root>/<prov
 ## Verification loop — run after EVERY edit
 
 ```bash
-./repoknife _selftest      # 66 checks, must be 0 failed (fixtures in mktemp, never touches real tree)
+./repoknife _selftest      # 92 checks, must be 0 failed (fixtures in mktemp under RK_TMP_ROOT, reaped on exit)
 shellcheck repoknife       # must be clean (justified disables only, with comment)
 /bin/bash ./repoknife --version   # must print the friendly "requires bash >= 4.4" guard, NOT a syntax error
 ```
@@ -38,18 +38,20 @@ Read-only smokes against the real tree: `./repoknife health --plain`, `sync --or
 ## Testing notes
 
 - Add selftest checks for any new pure logic (path parsing, config, TSV schemas) — `t::check name expected actual`.
-- TSV schemas are load-bearing: repo list = 8 cols, health status = 10 cols, runs = 7 cols. Producer/consumer drift is the classic regression — selftest checks field counts.
+- TSV schemas are load-bearing: repo list = 8 cols, health status = 10 cols, runs = 7 cols, syncstate = 4 cols. Producer/consumer drift is the classic regression — selftest schema-checks the producers by running the extracted `JQ_REPO_LIST` / `JQ_RUNS` filters on canned JSON, plus the status/syncstate worker rows on a git fixture.
 - Interactive flows can't be CI-tested; pty driving via `script(1)` is flaky — prefer extracting logic into testable functions and verify fzf matching with `fzf --filter`.
 
 ## Release pipeline (brew)
 
 Distribution: a dedicated tap repo `floriangrousset/homebrew-tap` → `brew install floriangrousset/tap/repoknife`. The release artifact is the **plain single-file script** (+ `repoknife.sha256`) — no shc/compilation (it would break the `$SELF` re-exec used by workers and fzf previews). Homebrew installs the script verbatim and `inreplace`s the shebang to the brewed bash (`Formula["bash"].opt_bin`).
 
-- `.github/workflows/ci.yml` — on PRs to develop/main + push to develop: `shellcheck`, `_selftest` on ubuntu (native bash 5) and macos (brew bash — system 3.2 can't run it), and a `guard-macos` job asserting `/bin/bash ./repoknife --version` exits 1 with `requires bash >= 4.4`.
-- `.github/workflows/release.yml` — on push to **main** (the develop→main merge commit): extracts `VERSION` (repoknife:23), skips if tag `vX.Y.Z` already exists (idempotent re-merge), re-runs the checks, tags + publishes a GitHub Release with `repoknife` + `repoknife.sha256`, then `bump-tap` (decoupled job) bumps the formula via `mislav/bump-homebrew-formula-action@v3` using the `HOMEBREW_TAP_TOKEN` secret (classic PAT, `repo`+`workflow`).
-- `Makefile` — `make check` (selftest+shellcheck+guard) · `build` (dist/) · `install-dev` (the ~/Code symlink) · `install-brew-local` · `release-dry-run`. `dist/` and `dist-tap/` are gitignored.
+- `.github/workflows/ci.yml` — on PRs to develop/main + push to develop: `shellcheck` (pinned release binary, `shellcheck repoknife`), `actionlint` (pinned, lints the workflow YAML + their embedded `run:` shell), `_selftest` on ubuntu (native bash 5) and macos (brew bash — system 3.2 can't run it), and a `guard-macos` job asserting `/bin/bash ./repoknife --version` exits 1 with `requires bash >= 4.4`.
+- `.github/workflows/release.yml` — on push to **main** (the develop→main merge commit): **fully automatic SemVer + CHANGELOG via `git-cliff`** (pinned binary, config in `cliff.toml`). It computes the next version from the Conventional Commits since the last tag (`git-cliff --bumped-version`: feat→minor · fix/perf→patch · `!`/BREAKING→major), and if there are releasable commits it: `sed`s `VERSION=` in the script, regenerates `CHANGELOG.md` (`git-cliff --bump`), re-runs the checks on the bumped script, **commits the bump to main** (`chore(release): vX.Y.Z [skip ci]`) + tags `vX.Y.Z`, publishes a Release (notes = the new changelog section via `git-cliff --unreleased --bump --strip all`) with `repoknife` + `repoknife.sha256`, then **fast-forwards develop** so develop/main keep shared SHAs. No releasable commits → it no-ops. `bump-tap` (decoupled job) bumps the formula with a **plain script** (computes the tag-tarball sha256, `sed`-rewrites the formula `url`+`sha256`, pushes) using `HOMEBREW_TAP_TOKEN` (classic PAT, `repo`+`workflow`). Pushing back to main/develop relies on **neither branch being protected** + GITHUB_TOKEN `contents:write` (and GITHUB_TOKEN pushes don't recursively re-trigger CI).
+- `Makefile` — `make check` (selftest+shellcheck+guard) · `build` (dist/) · `install-dev` (~/Code symlink) · `install-brew-local` · `changelog` / `version` / `release-dry-run` (all git-cliff-backed; degrade gracefully if git-cliff absent). `dist/` and `dist-tap/` are gitignored.
 
-**Routine release**: bump `VERSION="X.Y.Z"` (repoknife:23) on a feature branch → squash-merge to develop → PR develop→main (**merge commit**) → release.yml fires. The version bump is the release trigger; the human owns it.
+**Versioning**: `VERSION=` (repoknife:23) is the **last released** version and is **never hand-edited** — the release pipeline bumps it. `--version` prints `repoknife X.Y.Z` (line 1, kept stable for the brew formula test) and, on a dev git checkout, a second `build  <git describe> · <branch>` line so an unreleased local copy can't masquerade as the release (see `ver::print`). Local dev: `brew install git-cliff` to use `make changelog` / `make version` / `make release-dry-run`.
+
+**Routine release**: just PR develop→main (**merge commit**) — the pipeline computes the version, writes the changelog, tags, publishes, and syncs develop. Commit messages ARE the version+changelog source, so keep using Conventional Commits (a `feat` bumps the minor, etc.). No manual `VERSION` edit.
 
 **One-time setup** (outward-facing): create the tap repo (`gh repo create floriangrousset/homebrew-tap --public`), mint a classic PAT (browser; `repo`+`workflow`), `gh secret set HOMEBREW_TAP_TOKEN`, and bootstrap the first formula (the staged formula + tap README live in the gitignored `dist-tap/` — copy them into the tap repo, fill the sha256 of the tag tarball). `_selftest` requires the source tree (the template-sync check reads `dirname(REPOKNIFE_SELF)/.repoknife.conf`), so the formula's `test do` only runs `--version`.
 

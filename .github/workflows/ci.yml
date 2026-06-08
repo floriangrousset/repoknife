@@ -14,8 +14,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck
-        run: shellcheck repoknife
+      # Pin shellcheck so lint results are reproducible across runner-image bumps
+      # (a newer default-enabled check could turn the script red overnight, or a
+      # relaxed one let a real issue through). Keep the explicit `shellcheck
+      # repoknife` invocation so dev (Makefile) and CI lint the same way.
+      - name: shellcheck (pinned)
+        run: |
+          ver=v0.10.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz" | tar -xJ
+          "shellcheck-${ver}/shellcheck" --version
+          "shellcheck-${ver}/shellcheck" repoknife
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Lint the workflow YAML AND the non-trivial shell embedded in `run:` blocks
+      # (release.yml's formula-rewrite sed + curl|sha256 pipeline). ubuntu-latest
+      # ships shellcheck, which actionlint uses for the embedded-shell checks.
+      - name: actionlint (pinned)
+        run: |
+          ver=1.7.7
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz" | tar -xz actionlint
+          ./actionlint --version
+          ./actionlint -color
 
   selftest-linux:
     runs-on: ubuntu-latest
@@ -36,9 +58,13 @@ jobs:
       - name: install bash
         run: brew install bash
       - name: bash version
-        run: "$(brew --prefix)/bin/bash --version | head -1"
+        run: |
+          prefix="$(brew --prefix)"
+          "$prefix/bin/bash" --version | head -1
       - name: selftest (brew bash)
-        run: "$(brew --prefix)/bin/bash ./repoknife _selftest"
+        run: |
+          prefix="$(brew --prefix)"
+          "$prefix/bin/bash" ./repoknife _selftest
 
   guard-macos:
     runs-on: macos-latest

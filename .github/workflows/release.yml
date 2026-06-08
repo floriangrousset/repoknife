@@ -1,63 +1,83 @@
 name: release
 
+# Fully automatic SemVer + CHANGELOG, driven by Conventional Commits via git-cliff.
+# On every push to main (the develop->main merge), this:
+#   1. computes the next version from the commits since the last tag
+#      (feat -> minor, fix/perf -> patch, !/BREAKING -> major),
+#   2. writes VERSION= into the script and regenerates CHANGELOG.md,
+#   3. commits that bump to main, tags vX.Y.Z, publishes a Release (notes = the new
+#      changelog section), fast-forwards develop so it stays in sync, and
+#   4. bumps the Homebrew formula in the tap.
+# Humans never edit VERSION by hand. If there are no releasable commits, it no-ops.
+
 on:
   push:
     branches: [main]
 
 permissions:
-  contents: write   # create tags + releases
+  contents: write   # tag, release, and push the version+changelog bump back
 
 jobs:
   release:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.ver.outputs.version }}
-      released: ${{ steps.gate.outputs.released }}
+      version: ${{ steps.bump.outputs.version }}
+      released: ${{ steps.bump.outputs.released }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # need tags for the idempotency check
+          fetch-depth: 0   # full history + tags for git-cliff's version/changelog
 
-      - name: extract VERSION
-        id: ver
+      - name: install git-cliff (pinned)
         run: |
-          v="$(grep -E '^VERSION="[0-9]+\.[0-9]+\.[0-9]+"' repoknife \
-                 | head -1 | sed -E 's/^VERSION="([^"]+)".*/\1/')"
-          if [ -z "$v" ]; then echo "could not parse VERSION from repoknife" >&2; exit 1; fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "VERSION=$v"
+          ver=2.13.1
+          curl -fsSL "https://github.com/orhun/git-cliff/releases/download/v${ver}/git-cliff-${ver}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
+          echo "$PWD/git-cliff-${ver}" >> "$GITHUB_PATH"
+          "git-cliff-${ver}/git-cliff" --version
 
-      - name: idempotency gate (skip if tag/release exists)
-        id: gate
+      - name: compute next version (Conventional Commits -> SemVer)
+        id: bump
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v${{ steps.ver.outputs.version }}"
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
-             || gh release view "$tag" >/dev/null 2>&1; then
-            echo "tag $tag already exists -> skipping release"
-            echo "released=false" >> "$GITHUB_OUTPUT"
+          last="$(git describe --tags --abbrev=0 2>/dev/null || echo none)"
+          next="$(git-cliff --bumped-version 2>/dev/null || true)"
+          echo "last tag: $last   next: $next"
+          released=false; version=''; tag=''
+          if ! printf '%s' "$next" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "git-cliff returned no valid bump ('$next') — skipping"
+          elif [ "$next" = "$last" ]; then
+            echo "no releasable commits since $last — skipping"
+          elif gh release view "$next" >/dev/null 2>&1; then
+            echo "release $next already published — skipping (idempotent re-run)"
           else
-            echo "released=true" >> "$GITHUB_OUTPUT"
+            released=true; version="${next#v}"; tag="$next"
           fi
+          # gate on RELEASE existence, NOT tag existence: a half-done run (tag/commit
+          # pushed but `gh release create` failed) must re-run and finish, not skip.
+          { echo "released=$released"; echo "version=$version"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
 
-      - name: shellcheck
-        if: steps.gate.outputs.released == 'true'
-        run: shellcheck repoknife
-
-      - name: selftest
-        if: steps.gate.outputs.released == 'true'
-        run: ./repoknife _selftest
-
-      - name: guard string present
-        if: steps.gate.outputs.released == 'true'
+      - name: bump VERSION + regenerate CHANGELOG
+        if: steps.bump.outputs.released == 'true'
+        env:
+          VER: ${{ steps.bump.outputs.version }}
         run: |
-          grep -q 'requires bash >= 4.4' repoknife \
-            || { echo "guard string missing" >&2; exit 1; }
+          sed -i -E "s/^VERSION=\"[^\"]+\"/VERSION=\"$VER\"/" repoknife
+          grep -E '^VERSION=' repoknife
+          git-cliff --bump -o CHANGELOG.md
+
+      - name: verify the bumped script
+        if: steps.bump.outputs.released == 'true'
+        run: |
+          sc=v0.10.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${sc}/shellcheck-${sc}.linux.x86_64.tar.xz" | tar -xJ
+          "shellcheck-${sc}/shellcheck" repoknife
+          ./repoknife _selftest
+          grep -q 'requires bash >= 4.4' repoknife || { echo "guard string missing" >&2; exit 1; }
           bash ./repoknife --version
 
       - name: build assets
-        if: steps.gate.outputs.released == 'true'
+        if: steps.bump.outputs.released == 'true'
         run: |
           mkdir -p dist
           cp repoknife dist/repoknife
@@ -65,40 +85,70 @@ jobs:
           ( cd dist && shasum -a 256 repoknife > repoknife.sha256 )
           cat dist/repoknife.sha256
 
-      - name: create tag + release
-        if: steps.gate.outputs.released == 'true'
+      - name: commit bump, tag, release, sync develop
+        if: steps.bump.outputs.released == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          VER: ${{ steps.bump.outputs.version }}
         run: |
-          tag="v$VERSION"
-          git tag "$tag"
-          git push origin "$tag"
-          notes="$(printf '%s\n' \
-            "repoknife $tag" \
-            "" \
-            "Install / upgrade:" \
-            '```' \
-            "brew install floriangrousset/tap/repoknife   # first time" \
-            "brew upgrade repoknife                        # update" \
-            '```' \
-            "" \
-            "Assets: the plain \`repoknife\` script + \`repoknife.sha256\`.")"
-          gh release create "$tag" --title "$tag" --notes "$notes" \
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch -q origin main
+          # idempotent: if a prior partial run already pushed this bump to main, reuse it
+          # (so a re-run after a failed publish can't non-fast-forward main); else commit it.
+          if git show "origin/main:repoknife" 2>/dev/null | grep -q "^VERSION=\"$VER\""; then
+            echo "origin/main already bumped to $VER — reusing it"
+            sha="$(git rev-parse origin/main)"
+          else
+            git add repoknife CHANGELOG.md
+            git commit -qm "chore(release): $TAG [skip ci]"
+            git push origin "HEAD:refs/heads/main"
+            sha="$(git rev-parse HEAD)"
+          fi
+          # release notes = the newest CHANGELOG section + a short install snippet
+          awk '/^## \[/{n++} n==1{print} n==2{exit}' CHANGELOG.md > NOTES.md
+          {
+            printf '\n---\n\nInstall / upgrade:\n\n'
+            printf '```sh\n'
+            printf 'brew install floriangrousset/tap/repoknife   # first time\n'
+            printf 'brew upgrade repoknife                        # update\n'
+            printf '```\n'
+          } >> NOTES.md
+          # create the tag + release together AT the bump commit, so a failed publish
+          # never leaves an orphan tag (the gate skips only once the Release exists).
+          gh release create "$TAG" --target "$sha" --title "$TAG" --notes-file NOTES.md \
             dist/repoknife dist/repoknife.sha256
+          # keep develop in sync with main (shared SHAs) — best-effort fast-forward
+          git push origin "$sha:refs/heads/develop" \
+            || echo "::warning::could not fast-forward develop; run the develop sync manually"
 
   bump-tap:
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: bump homebrew formula
-        uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          formula-name: repoknife
-          formula-path: Formula/repoknife.rb
-          homebrew-tap: floriangrousset/homebrew-tap
-          tag-name: v${{ needs.release.outputs.version }}
-          download-url: https://github.com/floriangrousset/repoknife/archive/refs/tags/v${{ needs.release.outputs.version }}.tar.gz
+      # Plain script instead of a third-party action: deterministic, no Node
+      # deprecation, and avoids the "unexpected HTTP 303" the bump action hit
+      # fetching the tag tarball. Computes the tarball sha256 and rewrites the
+      # formula's url + sha256, then pushes to the tap.
+      - name: bump formula in the tap
         env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          url="https://github.com/floriangrousset/repoknife/archive/refs/tags/$tag.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | awk '{print $1}')"
+          echo "tarball sha256: $sha"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/floriangrousset/homebrew-tap.git" tap
+          cd tap
+          f="Formula/repoknife.rb"
+          sed -i -E "s#^  url \".*\"#  url \"$url\"#" "$f"
+          sed -i -E "s#^  sha256 \".*\"#  sha256 \"$sha\"#" "$f"
+          if git diff --quiet; then echo "formula already at $VERSION — nothing to do"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -aqm "repoknife $VERSION"
+          git push origin HEAD

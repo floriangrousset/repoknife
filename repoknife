@@ -72,6 +72,11 @@ fi
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/repoknife"
 CACHE_TTL="${REPOKNIFE_CACHE_TTL:-3600}"   # seconds
 JOBS="${REPOKNIFE_JOBS:-8}"
+# a bad REPOKNIFE_JOBS must degrade loudly to the default — not silently break the
+# run (non-numeric → xargs errors → swallowed → empty result) or fork-bomb a large
+# tree (0 means "as many as possible" to xargs). Reset non-positive-int, clamp high.
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || JOBS=8
+[ "$JOBS" -gt 64 ] && JOBS=64
 OS="$(uname -s)"
 
 PROVIDERS=(github azure-devops gitlab)
@@ -81,11 +86,16 @@ PROVIDERS=(github azure-devops gitlab)
 # there even on a real terminal, which is exactly how menus get captured.
 INTERACTIVE=0
 
-# mutable run-state flags (set by cli::parse_args; env-inheritable so the
-# hidden _worker children see the parent's --dry-run / fork filter)
+# mutable run-state flags (set by cli::parse_args). Exported HERE so every
+# re-exec child — the hidden _worker/__list/__fanout fast-paths — inherits the
+# parent's --plain / --dry-run / fork filter. The export attribute survives the
+# later re-assignments in cli::parse_args and cfg bootstrap, so a single export
+# at definition is enough (and is the one place that guarantees __list, which
+# reads EXCLUDE_FORKS for `gh repo list --source`, sees the right value).
 PLAIN="${PLAIN:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 EXCLUDE_FORKS="${EXCLUDE_FORKS:-0}"
+export PLAIN DRY_RUN EXCLUDE_FORKS
 USE_EXIT_CODE=0
 REFRESH=0
 ALL=0
@@ -94,9 +104,13 @@ ARG_PROVIDER=""
 CMD=""
 CMD_ARGS=()
 
-# temp-dir registry for the cleanup trap
+# per-process temp ROOT — every tmp::dir is created beneath it, so the cleanup
+# trap reaps them all with one rm -rf keyed on $$ (deterministic, and identical
+# in subshells). This replaces a registry array that was effectively dead:
+# tmp::dir is always called via $(...), so any array append happened in the
+# command-substitution subshell and was lost — the trap then deleted nothing.
 # (partial-clone cleanup is handled IN the worker; git clone removes its own dir on SIGINT)
-TMP_REGISTRY=()
+RK_TMP_ROOT="${TMPDIR:-/tmp}/repoknife.$$"
 
 color::enabled() {
   # fzf preview panes render ANSI but aren't TTYs — parent sets FORCE_COLOR
@@ -143,10 +157,11 @@ log::err()  { printf '%s%s %s%s\n' "$A_REDX" "$G_FAIL" "$*" "$A_RST" >&2; }
 log::die()  { log::err "$@"; exit 1; }
 
 cleanup::run() {
-  local d
-  for d in ${TMP_REGISTRY[@]+"${TMP_REGISTRY[@]}"}; do
-    [ -n "$d" ] && rm -rf "$d"
-  done
+  # at-most-once: the INT handler runs this, then re-raises INT which fires the
+  # EXIT trap → this again. Guard so it's safe regardless of which trap fires.
+  [ -n "${RK_CLEANED:-}" ] && return 0
+  RK_CLEANED=1
+  rm -rf "$RK_TMP_ROOT" 2>/dev/null || true   # one rm reaps every tmp::dir
   if [ -t 1 ]; then
     printf '\033[?7h\033[?25h' 2>/dev/null || true   # restore autowrap + cursor
     tput cnorm 2>/dev/null || true
@@ -156,11 +171,9 @@ trap cleanup::run EXIT
 trap 'cleanup::run; trap - INT; kill -INT $$' INT
 trap 'cleanup::run' TERM
 
-tmp::dir() {  # mktemp -d, registered for cleanup
-  local d
-  d="$(mktemp -d "${TMPDIR:-/tmp}/repoknife.XXXXXX")"
-  TMP_REGISTRY+=("$d")
-  printf '%s' "$d"
+tmp::dir() {  # mktemp -d beneath RK_TMP_ROOT; cleanup::run reaps the root wholesale
+  mkdir -p "$RK_TMP_ROOT" && chmod 700 "$RK_TMP_ROOT"
+  mktemp -d "$RK_TMP_ROOT/XXXXXX"
 }
 
 #============================================================================
@@ -607,14 +620,9 @@ provider::dispatch() {
   "$fn" "$@"
 }
 
-# ---------------------------------------------------------------- github (gh)
-provider_github_list_repos() {  # $1=org ; honors EXCLUDE_FORKS
-  local org="$1" extra=()
-  [ "$EXCLUDE_FORKS" -eq 1 ] && extra+=(--source)
-  # default --limit is 30 and silently truncates large accounts — always 1000
-  gh repo list "$org" --limit 1000 ${extra[@]+"${extra[@]}"} \
-     --json name,isFork,isArchived,isEmpty,defaultBranchRef,pushedAt,sshUrl,description \
-  | jq -r '.[] | [
+# normalized repo-list jq → 8-col TSV. Held in a constant so the selftest can
+# schema-check it (producer/consumer column drift is the classic regression).
+JQ_REPO_LIST='.[] | [
       .name,
       (if .isFork then "1" else "0" end),
       (if .isArchived then "1" else "0" end),
@@ -624,6 +632,14 @@ provider_github_list_repos() {  # $1=org ; honors EXCLUDE_FORKS
       .sshUrl,
       ((.description // "") | gsub("[[:cntrl:]]"; " "))
     ] | @tsv'
+# ---------------------------------------------------------------- github (gh)
+provider_github_list_repos() {  # $1=org ; honors EXCLUDE_FORKS
+  local org="$1" extra=()
+  [ "$EXCLUDE_FORKS" -eq 1 ] && extra+=(--source)
+  # default --limit is 30 and silently truncates large accounts — always 1000
+  gh repo list "$org" --limit 1000 ${extra[@]+"${extra[@]}"} \
+     --json name,isFork,isArchived,isEmpty,defaultBranchRef,pushedAt,sshUrl,description \
+  | jq -r "$JQ_REPO_LIST"
 }
 
 provider_github_clone_repo() {  # $1=org $2=repo $3=target-dir $4=clone-url(unused)
@@ -767,21 +783,37 @@ worker::fanout() {  # $1=verb ; items on stdin (one per line) ; merged TSV on st
   outdir="$(tmp::dir)"
   n="$(worker::write_items "$outdir")"
   [ "$n" -eq 0 ] && return 0
-  export REPOKNIFE_CODE_ROOT="$CODE_ROOT" DRY_RUN EXCLUDE_FORKS
+  export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # DRY_RUN/EXCLUDE_FORKS exported once at top
   seq 0 $((n-1)) | xargs -P "$JOBS" -I{} "$SELF" _worker "$verb" "$outdir" {} >/dev/null 2>&1 || true
-  local j=0
-  while [ "$j" -lt "$n" ]; do cat "$outdir/$j.out" 2>/dev/null || true; j=$((j+1)); done
+  # reconcile: a worker killed/crashed before its atomic mv leaves no .out — never
+  # drop it silently (this tool's whole job is an accurate inventory). Synthesize an
+  # error row from the saved item so every requested item is always accounted for.
+  local j=0 item
+  while [ "$j" -lt "$n" ]; do
+    if [ -f "$outdir/$j.out" ]; then
+      cat "$outdir/$j.out"
+    else
+      # fanout items are single-field (relpath / owner-repo); multi-field verbs go
+      # through batch::run. tr tabs→spaces so the synthesized row stays exactly 3-col.
+      item="$(tr '\t' ' ' < "$outdir/item.$j" 2>/dev/null)"
+      printf 'error\t%s\tworker did not complete (killed/crashed)\n' "$item"
+    fi
+    j=$((j+1))
+  done
 }
 
 # worker entry — argv: verb outdir index (item read from $outdir/item.$index)
 worker::entry() {
-  local verb="$1" outdir="$2" idx="$3" item
+  local verb="$1" outdir="$2" idx="$3" item msg
   item="$(cat "$outdir/item.$idx")"
   touch "$outdir/$idx.start"
   if "worker::do_$verb" "$item" > "$outdir/$idx.tmp" 2>"$outdir/$idx.err"; then
     :
   else
-    printf 'error\t%s\t%s\n' "$item" "$(tr '\n\t' '  ' < "$outdir/$idx.err" | cut -c1-160)" > "$outdir/$idx.tmp"
+    msg="$(tr '\n\t' '  ' < "$outdir/$idx.err" | cut -c1-160)"
+    # a quiet set -e trip can leave .err empty — never emit a reasonless error row
+    [ -z "${msg// /}" ] && msg="worker '$verb' exited non-zero (no stderr) — re-run with --plain to see why"
+    printf 'error\t%s\t%s\n' "$item" "$msg" > "$outdir/$idx.tmp"
   fi
   mv "$outdir/$idx.tmp" "$outdir/$idx.out"
 }
@@ -817,6 +849,19 @@ worker::do_status() {
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$rel" "$branch" "$dirty" "$ahead" "$behind" "$gone" "$dev" "$fetch" "$rank" "$label"
+}
+
+# --- syncstate verb: item = cloned repo relpath → "rel<TAB>dirty<TAB>ahead<TAB>behind"
+# parallel local-state for the Sync table — sync::browse used to compute this
+# serially in the main shell (~3 git spawns per cloned repo). Only cloned repos
+# are passed in; join the result back by repo name.
+worker::do_syncstate() {
+  local rel="$1" dir ab dirty ahead behind
+  dir="$CODE_ROOT/$rel"
+  dirty="$(git::dirty_count "$dir")"
+  ab="$(git::ahead_behind "$dir")"
+  ahead="${ab%%	*}"; behind="${ab##*	}"
+  printf '%s\t%s\t%s\t%s\n' "$rel" "$dirty" "$ahead" "$behind"
 }
 
 # --- pull verb: item = repo relpath → "ok|skip|error <rel> <message>" --------
@@ -864,11 +909,10 @@ worker::do_clone() {
 
 # --- runs verb: item = "owner/repo" → recent workflow-run rows ----------------
 # out per run: id  owner/repo  glyphclass  workflow  branch  age  title
-worker::do_runs() {
-  local nwo="$1"
-  gh run list -R "$nwo" --limit 5 \
-     --json databaseId,status,conclusion,displayTitle,workflowName,headBranch,createdAt 2>/dev/null \
-  | jq -r --arg r "$nwo" '.[] | [
+# normalized runs jq → 7-col TSV (schema-checked in selftest). $r is a jq
+# variable supplied via --arg, hence the single-quote SC2016 disable.
+# shellcheck disable=SC2016
+JQ_RUNS='.[] | [
       (.databaseId | tostring), $r,
       (if .status != "completed" then (if .status == "queued" then "queued" else "running" end)
        elif .conclusion == "success" then "pass"
@@ -878,7 +922,12 @@ worker::do_runs() {
       ((.headBranch // "") | gsub("[[:cntrl:]]"; " ")),
       .createdAt,
       ((.displayTitle // "") | gsub("[[:cntrl:]]"; " "))
-    ] | @tsv' || true
+    ] | @tsv'
+worker::do_runs() {
+  local nwo="$1"
+  gh run list -R "$nwo" --limit 5 \
+     --json databaseId,status,conclusion,displayTitle,workflowName,headBranch,createdAt 2>/dev/null \
+  | jq -r --arg r "$nwo" "$JQ_RUNS" || true
 }
 
 # --- syncitem verb: item = "clone<TAB>…" or "pull<TAB>rel" -------------------
@@ -909,7 +958,7 @@ batch::run() {  # $1 = worker verb
   BATCH_RESULTS=()
   [ "$n" -eq 0 ] && return 0
   outdir="$(tmp::dir)"
-  export REPOKNIFE_CODE_ROOT="$CODE_ROOT" DRY_RUN EXCLUDE_FORKS
+  export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # DRY_RUN/EXCLUDE_FORKS exported once at top
   printf '%s\n' "${BATCH_ITEMS[@]}" | worker::write_items "$outdir" >/dev/null
   seq 0 $((n-1)) \
     | xargs -P "$JOBS" -I{} "$SELF" _worker "$verb" "$outdir" {} >/dev/null 2>&1 &
@@ -929,10 +978,18 @@ batch::run() {  # $1 = worker verb
   else
     wait "$xpid" 2>/dev/null || true
   fi
-  local j=0 f
+  # reconcile: an item whose worker was killed before its atomic mv leaves no .out —
+  # synthesize a failure row so batch::summary accounts for EVERY item (a
+  # "Sync complete · 0 failed" box must never silently omit an interrupted clone/pull).
+  local j=0 f irel
   while [ "$j" -lt "$n" ]; do
     f="$outdir/$j.out"
-    [ -f "$f" ] && BATCH_RESULTS+=("$(cat "$f")")
+    if [ -f "$f" ]; then
+      BATCH_RESULTS+=("$(cat "$f")")
+    else
+      irel="${BATCH_ITEMS[$j]#*$'\t'}"; irel="${irel%%$'\t'*}"   # field 2 = relpath
+      BATCH_RESULTS+=("error"$'\t'"$irel"$'\t'"interrupted — no result (re-run; check for a partial clone)")
+    fi
     j=$((j+1))
   done
 }
@@ -1111,6 +1168,8 @@ mod::sync() {
         [ "$SEL_WAS_MENU" -eq 1 ] && NAV+=(provider)
         STEP=org ;;
       org)
+        # azure-devops: an unset org falls back to the configured default (if any)
+        [ -z "$arg_org" ] && [ "$provider" = azure-devops ] && arg_org="$(cfg::get ado_default_org)"
         if [ -n "$arg_org" ]; then org="$arg_org"
         else
           if ! mod::pick_org "$provider"; then nav::pop && continue; return 0; fi
@@ -1150,54 +1209,70 @@ sync::browse() {  # $1=provider $2=org $3=project — fetch, table, select, exec
   fi
   [ -z "$tsv" ] && { log::warn "no repos found for $org"; return 0; }
 
-  # ---- cross-reference local state, build table ----
+  # ---- cross-reference local state (fanned out, like health) ----
   local tmptsv; tmptsv="$(tmp::dir)/sync.tsv"
   printf '%s\n' "$tsv" > "$tmptsv"
+
+  # collect already-cloned repos under this provider/org[/project] ONCE (one disco
+  # walk feeds both the state fanout and orphan detection), then compute their
+  # dirty/ahead/behind in PARALLEL via the worker pool. sync::browse used to do ~3
+  # serial git spawns per cloned repo in the main shell — slow on large orgs.
+  local pfx lrel
+  if [ -n "$project" ]; then pfx="$provider/$org/$project"; else pfx="$provider/$org"; fi
+  declare -A ST_DIRTY=() ST_AHEAD=() ST_BEHIND=() ST_CLONED=()
+  local cloned=()
+  while IFS= read -r lrel; do
+    [ -z "$lrel" ] && continue
+    case "$lrel" in "$pfx"/*) cloned+=("$lrel"); ST_CLONED["${lrel##*/}"]=1 ;; esac
+  done < <(disco::local_repos "$provider")
+  if [ "${#cloned[@]}" -gt 0 ]; then
+    local strows srel sdirty sahead sbehind snm
+    strows="$(printf '%s\n' "${cloned[@]}" | ui::spin "Checking ${#cloned[@]} local clone(s)…" "$SELF" __fanout syncstate)"
+    while IFS=$'\t' read -r srel sdirty sahead sbehind; do
+      [ -z "$srel" ] && continue
+      [ "$srel" = "error" ] && continue
+      snm="${srel##*/}"
+      ST_DIRTY["$snm"]="$sdirty"; ST_AHEAD["$snm"]="$sahead"; ST_BEHIND["$snm"]="$sbehind"
+    done <<< "$strows"
+  fi
+
   local cols namew
   cols=$(ui::cols)
   namew=$(( cols >= 160 ? 50 : cols >= 120 ? 40 : 30 ))
   local lines=() name fork arch empty defbranch pushed url desc
-  local dir rel state ab ahead behind badges disp remote_names=" "
+  local state ahead behind badges disp
+  declare -A remote_set=()
   while IFS=$'\t' read -r name fork arch empty defbranch pushed url desc; do
     [ -z "$name" ] && continue
-    remote_names="$remote_names$name "
-    if [ -n "$project" ]; then rel="$provider/$org/$project/$name"; else rel="$provider/$org/$name"; fi
-    dir="$CODE_ROOT/$rel"
+    remote_set["$name"]=1
     badges=""
     [ "$fork" = "1" ] && badges="$badges ${A_PURPLE}[FORK]${A_RST}"
     [ "$arch" = "1" ] && badges="$badges ${A_PURPLE}[ARCH]${A_RST}"
     [ "$empty" = "1" ] && badges="$badges ${A_FAINT}[EMPTY]${A_RST}"
-    if git::is_repo "$dir"; then
-      if [ "$(git::dirty_count "$dir")" -gt 0 ]; then
+    if [ -n "${ST_CLONED[$name]:-}" ]; then
+      if [ "${ST_DIRTY[$name]:-0}" -gt 0 ] 2>/dev/null; then
         state="${A_YELLOW}${G_DIRTY}${A_RST}"; badges="$badges ${A_YELLOW}[DIRTY]${A_RST}"
       else
         state="${A_DIM}${G_CLEAN}${A_RST}"
       fi
-      ab="$(git::ahead_behind "$dir")"
-      ahead="${ab%%	*}"; behind="${ab##*	}"
+      ahead="${ST_AHEAD[$name]:--}"; behind="${ST_BEHIND[$name]:--}"
       [ "$behind" != "-" ] && [ "$behind" != "0" ] && badges="$badges ${A_YELLOW}[${G_BEHIND}${behind}]${A_RST}"
       [ "$ahead"  != "-" ] && [ "$ahead"  != "0" ] && badges="$badges ${A_BLUE}[${G_AHEAD}${ahead}]${A_RST}"
     else
       state="${A_FAINT}${G_NOTC}${A_RST}"; badges="$badges ${A_GREEN}[NEW]${A_RST}"
     fi
     disp="$state $(printf "%-${namew}s" "$(ui::trunc "$name" "$namew")")$badges ${A_DIM}$(ui::age "$pushed")${A_RST}"
-    lines+=("$name	$disp")
+    lines+=("$name"$'\t'"$disp")
   done <<< "$tsv"
 
-  # orphaned: local dirs absent from the remote list (renamed/deleted upstream)
-  local orphans=() lrel lname
-  while IFS= read -r lrel; do
-    [ -z "$lrel" ] && continue
-    if [ -n "$project" ]; then
-      case "$lrel" in "$provider/$org/$project"/*) : ;; *) continue ;; esac
-    else
-      case "$lrel" in "$provider/$org"/*) : ;; *) continue ;; esac
-    fi
-    lname="$(basename "$lrel")"
-    case "$remote_names" in *" $lname "*) continue ;; esac
-    orphans+=("$lname")
-    lines+=("!$lname	${A_REDX}${G_WARN}${A_RST} $(printf "%-${namew}s" "$lname")${A_REDX}[ORPHANED]${A_RST} ${A_DIM}local only — remote renamed/deleted?${A_RST}")
-  done < <(disco::local_repos "$provider")
+  # orphaned: cloned dirs absent from the remote list (renamed/deleted upstream).
+  # O(1) membership via remote_set; reuse the already-collected `cloned` (no 2nd walk).
+  local lname
+  for lrel in ${cloned[@]+"${cloned[@]}"}; do
+    lname="${lrel##*/}"
+    [ -n "${remote_set[$lname]:-}" ] && continue
+    lines+=("!$lname"$'\t'"${A_REDX}${G_WARN}${A_RST} $(printf "%-${namew}s" "$lname")${A_REDX}[ORPHANED]${A_RST} ${A_DIM}local only — remote renamed/deleted?${A_RST}")
+  done
 
   # ---- plain / non-interactive path ----
   if ! ui::is_interactive; then
@@ -1565,7 +1640,7 @@ mod::runs() {
 
   # sort newest first by createdAt (field 6), cap at 40
   # (grep -v exits 1 when it filters EVERYTHING — must not abort under pipefail)
-  rows="$(sort -t$'\t' -k6,6r <<< "$rows" | grep -v '^error	' | head -40 || true)"
+  rows="$(LC_ALL=C sort -t$'\t' -k6,6r <<< "$rows" | grep -v '^error	' | head -40 || true)"
 
   local cols repow wfw brw
   cols=$(ui::cols)
@@ -1639,16 +1714,23 @@ mod::health() {
   while IFS= read -r rel; do [ -n "$rel" ] && repos+=("$rel"); done < <(disco::local_repos)
   [ "${#repos[@]}" -eq 0 ] && { log::warn "no local repos found under $CODE_ROOT"; return 0; }
 
-  local rows
-  rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${#repos[@]} repos…" "$SELF" __fanout status)"
-  rows="$(sort -t$'\t' -k9,9n -k1,1 <<< "$rows")"
+  local discovered=${#repos[@]} rows
+  rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${discovered} repos…" "$SELF" __fanout status)"
+  rows="$(LC_ALL=C sort -t$'\t' -k9,9n -k1,1 <<< "$rows")"   # C locale: byte-deterministic, BSD/GNU-identical, broken-locale-safe
+  # a totally empty result for a non-empty tree is a fan-out FAILURE, not "all clean"
+  if [ -z "${rows//[[:space:]]/}" ]; then
+    log::err "health scan produced no results for $discovered repo(s) — worker fan-out failed"
+    if [ "$USE_EXIT_CODE" -eq 1 ] && ! ui::is_interactive; then exit 255; fi
+    return 1
+  fi
 
-  # counts
-  local dirty=0 unpushed=0 behind=0 nodev=0 gone=0 attention=0 total=0
+  # counts (errored = repos that could not be scanned — folded into attention so a
+  # broken scan can never read as a clean tree)
+  local dirty=0 unpushed=0 behind=0 nodev=0 gone=0 attention=0 total=0 errored=0
   local r branch d a b g dev fetch rank label
   while IFS=$'\t' read -r rel branch d a b g dev fetch rank label; do
     [ -z "$rel" ] && continue
-    [ "$rel" = "error" ] && continue
+    if [ "$rel" = "error" ]; then errored=$((errored+1)); attention=$((attention+1)); continue; fi
     total=$((total+1))
     [ "$d" -gt 0 ] 2>/dev/null && dirty=$((dirty+1))
     [ "$a" != "-" ] && [ "$a" -gt 0 ] 2>/dev/null && unpushed=$((unpushed+1))
@@ -1660,8 +1742,8 @@ mod::health() {
 
   # persist counts for the instant main-menu header
   mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"
-  printf '{"at":%s,"repos":%s,"dirty":%s,"behind":%s,"attention":%s}\n' \
-    "$(date +%s)" "$total" "$dirty" "$behind" "$attention" > "$CACHE_DIR/counts.json"
+  printf '{"at":%s,"repos":%s,"scanned":%s,"dirty":%s,"behind":%s,"attention":%s,"errored":%s}\n' \
+    "$(date +%s)" "$discovered" "$total" "$dirty" "$behind" "$attention" "$errored" > "$CACHE_DIR/counts.json"
 
   # display lines (column widths scale with the terminal)
   local cols repow brw
@@ -1670,7 +1752,11 @@ mod::health() {
   local lines=() prov rest disp pcol
   while IFS=$'\t' read -r rel branch d a b g dev fetch rank label; do
     [ -z "$rel" ] && continue
-    if [ "$rel" = "error" ]; then continue; fi
+    if [ "$rel" = "error" ]; then
+      # error row: $branch holds the failed relpath, $d holds the message
+      lines+=("$branch"$'\t'"${A_REDX}$(printf '%-3s' '!!')$(printf "%-${repow}s" "$(ui::trunc "$branch" "$repow")")${A_RST} ${A_REDX}scan failed: $(ui::trunc "$d" 40)${A_RST}")
+      continue
+    fi
     prov="${rel%%/*}"; rest="${rel#*/}"
     case "$prov" in github) prov=gh ;; azure-devops) prov=az ;; gitlab) prov=gl ;; esac
     local stxt scol pad
@@ -1693,13 +1779,17 @@ mod::health() {
     lines+=("$rel	$(printf '%-3s' "$prov")$(printf "%-${repow}s" "$(ui::trunc "$rest" "$repow")") ${A_BLUE}$(printf "%-${brw}s" "$(ui::trunc "$branch" "$brw")")${A_RST} $disp dev:$pcol ${A_FAINT}fetch:$fetch${A_RST}")
   done <<< "$rows"
 
-  local summary="💚 Health · $total repos · $G_WARN $attention need attention
+  local summary="💚 Health · $discovered repos · $G_WARN $attention need attention
 $G_DIRTY $dirty dirty · $G_AHEAD $unpushed unpushed · $G_BEHIND $behind behind · $G_FAIL $nodev no-develop · ⌫ $gone gone-branches"
+  [ "$errored" -gt 0 ] && summary="$summary · $G_WARN $errored unscannable"
 
   if ! ui::is_interactive; then
     printf '%s\n' "${lines[@]}" | cut -f2- | ui::strip_ansi
-    printf '\n%s repos need attention (of %s)\n' "$attention" "$total"
+    printf '\n%s repos need attention (of %s)' "$attention" "$discovered"
+    [ "$errored" -gt 0 ] && printf ' · %s unscannable' "$errored"
+    printf '\n'
     if [ "$USE_EXIT_CODE" -eq 1 ]; then
+      # errored repos are folded into attention, so a broken scan can't read as exit 0
       # exit codes wrap mod 256 — clamp so 256+ attention repos never read as success
       [ "$attention" -gt 254 ] && exit 254
       exit "$attention"
@@ -1708,7 +1798,7 @@ $G_DIRTY $dirty dirty · $G_AHEAD $unpushed unpushed · $G_BEHIND $behind behind
   fi
 
   ui::page "Health" "every local repo, worst-first · enter a repo to inspect & fix (lazygit · fetch · pull · create develop · cleanup)" \
-    "$total repos · $G_WARN $attention attention"
+    "$discovered repos · $G_WARN $attention attention"
   ui::box "$( [ "$attention" -eq 0 ] && echo "$C_GREEN" || echo "$C_YELLOW" )" "$summary"
   # NOTE: fzf auto-quotes {1} — it must stand alone, NEVER inside quotes
   local qroot colhdr
@@ -1899,7 +1989,7 @@ mod::config() {
           "ado_default_org" "ado_project_map" "default_visibility" \
           "exclude_forks_default" "📄  show all" "←  Back")" || return 0
     case "$key" in
-      *show*) mod::config list; ui::is_interactive && { printf '  (enter to continue) '; read -r; } ;;
+      *show*) mod::config list; ui::is_interactive && { printf '  (enter to continue) '; read -r || true; } ;;
       *Back*) return 0 ;;
       *)
         local ph='comma-separated / org:project'
@@ -2194,6 +2284,21 @@ menu::loop() {
   done
 }
 
+ver::print() {  # `--version`: always "repoknife X.Y.Z" (line 1, kept stable for the
+  # brew formula test); on a dev checkout add a build line so an unreleased local
+  # copy can't masquerade as the last release. VERSION is the last RELEASED version;
+  # the release pipeline bumps it automatically — git describe shows how far ahead.
+  printf 'repoknife %s\n' "$VERSION"
+  command -v git >/dev/null || return 0
+  local dir desc br
+  dir="$(dirname "$SELF")"
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  desc="$(git -C "$dir" describe --tags --always --dirty 2>/dev/null || true)"
+  br="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$desc" ] && printf '  build  %s%s\n' "$desc" "${br:+ · $br}"
+  return 0   # never let the trailing && be the failing leaf (set -e would abort --version)
+}
+
 cli::help() {
   cat <<EOF
 
@@ -2209,7 +2314,7 @@ cli::help() {
     pr       [scope]              PR dashboard · scope: all·mine·review·assigned·mentions
     runs     [org]                workflow runs · watch · rerun failed
     health                        scan every local repo for problems
-    cleanup  [provider/org/repo]  prune gone/merged branches · sync develop
+    cleanup  [repo-path]          prune gone/merged branches · sync develop
     config   [list]               orgs · ADO defaults · fork filter
 
   FLAGS
@@ -2247,7 +2352,7 @@ cli::parse_args() {
       --org=*)            ARG_ORG="${1#*=}" ;;
       --provider)         ARG_PROVIDER="${2:?--provider needs a value}"; shift ;;
       --provider=*)       ARG_PROVIDER="${1#*=}" ;;
-      -V|--version)       printf 'repoknife %s\n' "$VERSION"; exit 0 ;;
+      -V|--version)       ver::print; exit 0 ;;
       -h|--help)          CMD=help; return 0 ;;
       --)                 shift; args+=("$@"); break ;;
       -*)                 printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 1 ;;
@@ -2504,10 +2609,47 @@ EOF
   t::check "fix offer plain no-run" "absent" "$( [ -e "$fix/should_not_run" ] && echo ran || echo absent )"
   t::check "fix offer plain prints cmd" "yes" "$(grep -q 'touch ' <<< "$fixout" && echo yes || echo no)"
 
+  # --- ui:: pure formatters (column alignment + the terminal-injection defense) ---
+  t::check "trunc fits"        "abc"  "$(ui::trunc abc 5)"
+  t::check "trunc ellipsis"    "ab…"  "$(ui::trunc abcdef 3)"
+  t::check "age zero sentinel" "?"    "$(ui::age 0)"
+  t::check "age relative 2h"   "2h"   "$(ui::age "$(( $(date +%s) - 7200 ))")"
+  t::check "strip_ansi OSC"    "X"    "$(printf '\033]0;pwn\007X' | ui::strip_ansi)"
+  t::check "strip_ansi CSI"    "red"  "$(printf '\033[31mred\033[0m' | ui::strip_ansi)"
+  # --version line 1 must stay exactly "repoknife X.Y.Z" (the brew formula test asserts it)
+  t::check "version line shape" "yes" "$(v="$(ver::print)"; v="${v%%$'\n'*}"; [[ "$v" =~ ^repoknife[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] && echo yes || echo no)"
+
+  # --- cache::file sanitization: config-supplied org/project must not escape CACHE_DIR ---
+  t::check "cache key slash to _"   "$fix/c/github__a_b_c__x.tsv"   "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github 'a/b/c' 'x')"
+  t::check "cache key no traversal" "$fix/c/github__.._.._etc.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github '../../etc' '')"
+  t::check "cache key fork suffix"  "$fix/c/github__o__nofork.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=1 cache::file github o '')"
+
+  # --- TSV producer schemas (lock the 8-col repo-list & 7-col runs against drift) ---
+  if command -v jq >/dev/null; then
+    t::check "repo-list TSV cols" "8" \
+      "$(printf '%s' '[{"name":"r","isFork":false,"isArchived":false,"isEmpty":false,"defaultBranchRef":{"name":"main"},"pushedAt":"2024-01-01T00:00:00Z","sshUrl":"git@x:o/r.git","description":"d\u0007e"}]' | jq -r "$JQ_REPO_LIST" | awk -F'\t' '{print NF; exit}')"
+    t::check "repo-list cntrl stripped" "d e" \
+      "$(printf '%s' '[{"name":"r","isFork":false,"isArchived":false,"isEmpty":false,"defaultBranchRef":null,"pushedAt":"-","sshUrl":"u","description":"d\u0007e"}]' | jq -r "$JQ_REPO_LIST" | cut -f8)"
+    t::check "runs TSV cols" "7" \
+      "$(printf '%s' '[{"databaseId":1,"status":"completed","conclusion":"success","displayTitle":"t","workflowName":"w","headBranch":"b","createdAt":"2024-01-01T00:00:00Z"}]' | jq -r --arg r 'o/r' "$JQ_RUNS" | awk -F'\t' '{print NF; exit}')"
+  fi
+
+  # --- worker dry/dispatch branches (pure) ---
+  t::check "clone dry-run"           $'ok\tgithub/acme/new\tDRY: would clone' "$(DRY_RUN=1 worker::do_clone $'github/acme/new\turl\tmain')"
+  t::check "syncitem unknown action" "error" "$(worker::do_syncitem $'bogus\tx' | cut -f1)"
+
   # --- worker fanout round-trip (xargs + item files preserve tabs) ---
   local fan
   fan="$(DRY_RUN=1 worker::fanout syncitem <<< $'pull\tgithub/acme/widget')"
   t::check "fanout tab round-trip" "ok	github/acme/widget	DRY: would pull" "$fan"
+
+  # --- run-state flags exported so re-exec children (__list) inherit them (--no-forks fix) ---
+  t::check "exclude_forks exported" "yes" "$(declare -p EXCLUDE_FORKS 2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+  t::check "plain exported"         "yes" "$(declare -p PLAIN         2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+  t::check "dry_run exported"       "yes" "$(declare -p DRY_RUN       2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+
+  # --- tmp::dir lives beneath the per-process root so the cleanup trap can reap it ---
+  t::check "tmp dir under root" "yes" "$(d="$(tmp::dir)"; case "$d" in "$RK_TMP_ROOT"/*) echo yes ;; *) echo no ;; esac)"
 
   # --- cli args (safe to mutate globals: selftest exits right after) ---
   cli::parse_args --org acme sync --no-forks --dry-run extra
@@ -2536,6 +2678,27 @@ EOF
     local row; row="$(worker::do_status "github/acme/gitfix")"
     t::check "status row fields" "10" "$(awk -F'\t' '{print NF}' <<< "$row")"
     t::check "status row label" "ok" "$(cut -f10 <<< "$row")"
+    # syncstate worker row shape (4 TSV fields) — lock the new schema (clean fixture)
+    local srow; srow="$(worker::do_syncstate "github/acme/gitfix")"
+    t::check "syncstate row fields" "4" "$(awk -F'\t' '{print NF}' <<< "$srow")"
+    # rank ladder: a staged change → dirty (rank 1). The precedence is data-safety-critical
+    # (a diverged/dirty repo mis-ranked as ok is exactly what health must never do).
+    printf 'x\n' > "$repo/dirtyfile"; git -C "$repo" add dirtyfile
+    local drow; drow="$(worker::do_status "github/acme/gitfix")"
+    t::check "status rank dirty"  "1"     "$(cut -f9  <<< "$drow")"
+    t::check "status label dirty" "dirty" "$(cut -f10 <<< "$drow")"
+    # do_pull refuses a dirty tree (gotcha #11: skipped, never autostashed) before any pull
+    t::check "pull skips dirty" "skip" "$(DRY_RUN=0 worker::do_pull github/acme/gitfix | cut -f1)"
+    # a repo with no develop branch → rank 2
+    local repo2="$fix/github/acme/nodev"
+    git init -q -b main "$repo2" 2>/dev/null
+    ( cd "$repo2" && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init ) || true
+    t::check "status rank no-develop" "2" "$(cut -f9 <<< "$(worker::do_status github/acme/nodev)")"
+    # git::merged_into: a branch at main is an ancestor (merged); a branch ahead is not
+    git -C "$repo2" branch feat
+    git::merged_into "$repo2" feat main && t::check "merged_into ancestor" "yes" "yes" || t::check "merged_into ancestor" "yes" "no"
+    ( cd "$repo2" && git checkout -q feat && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m ahead && git checkout -q main ) || true
+    git::merged_into "$repo2" feat main && t::check "merged_into not-merged" "no" "yes" || t::check "merged_into not-merged" "no" "no"
   fi
 
   printf '\n%d passed, %d failed\n' "$T_PASS" "$T_FAIL"
