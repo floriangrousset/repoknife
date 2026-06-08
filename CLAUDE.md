@@ -5,7 +5,7 @@ Single-file bash TUI (`./repoknife`, ~2,400 lines) managing a `<code-root>/<prov
 ## Verification loop — run after EVERY edit
 
 ```bash
-./repoknife _selftest      # 70 checks, must be 0 failed (fixtures in mktemp under RK_TMP_ROOT, reaped on exit)
+./repoknife _selftest      # 91 checks, must be 0 failed (fixtures in mktemp under RK_TMP_ROOT, reaped on exit)
 shellcheck repoknife       # must be clean (justified disables only, with comment)
 /bin/bash ./repoknife --version   # must print the friendly "requires bash >= 4.4" guard, NOT a syntax error
 ```
@@ -38,7 +38,7 @@ Read-only smokes against the real tree: `./repoknife health --plain`, `sync --or
 ## Testing notes
 
 - Add selftest checks for any new pure logic (path parsing, config, TSV schemas) — `t::check name expected actual`.
-- TSV schemas are load-bearing: repo list = 8 cols, health status = 10 cols, runs = 7 cols. Producer/consumer drift is the classic regression — selftest checks field counts.
+- TSV schemas are load-bearing: repo list = 8 cols, health status = 10 cols, runs = 7 cols, syncstate = 4 cols. Producer/consumer drift is the classic regression — selftest schema-checks the producers by running the extracted `JQ_REPO_LIST` / `JQ_RUNS` filters on canned JSON, plus the status/syncstate worker rows on a git fixture.
 - Interactive flows can't be CI-tested; pty driving via `script(1)` is flaky — prefer extracting logic into testable functions and verify fzf matching with `fzf --filter`.
 
 ## Release pipeline (brew)
