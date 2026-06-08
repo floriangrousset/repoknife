@@ -41,9 +41,13 @@ jobs:
             echo "released=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: shellcheck
+      - name: shellcheck (pinned)
         if: steps.gate.outputs.released == 'true'
-        run: shellcheck repoknife
+        run: |
+          ver=v0.10.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz" | tar -xJ
+          "shellcheck-${ver}/shellcheck" --version
+          "shellcheck-${ver}/shellcheck" repoknife
 
       - name: selftest
         if: steps.gate.outputs.released == 'true'

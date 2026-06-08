@@ -5,7 +5,7 @@ Single-file bash TUI (`./repoknife`, ~2,400 lines) managing a `<code-root>/<prov
 ## Verification loop — run after EVERY edit
 
 ```bash
-./repoknife _selftest      # 66 checks, must be 0 failed (fixtures in mktemp, never touches real tree)
+./repoknife _selftest      # 70 checks, must be 0 failed (fixtures in mktemp under RK_TMP_ROOT, reaped on exit)
 shellcheck repoknife       # must be clean (justified disables only, with comment)
 /bin/bash ./repoknife --version   # must print the friendly "requires bash >= 4.4" guard, NOT a syntax error
 ```
@@ -45,8 +45,8 @@ Read-only smokes against the real tree: `./repoknife health --plain`, `sync --or
 
 Distribution: a dedicated tap repo `floriangrousset/homebrew-tap` → `brew install floriangrousset/tap/repoknife`. The release artifact is the **plain single-file script** (+ `repoknife.sha256`) — no shc/compilation (it would break the `$SELF` re-exec used by workers and fzf previews). Homebrew installs the script verbatim and `inreplace`s the shebang to the brewed bash (`Formula["bash"].opt_bin`).
 
-- `.github/workflows/ci.yml` — on PRs to develop/main + push to develop: `shellcheck`, `_selftest` on ubuntu (native bash 5) and macos (brew bash — system 3.2 can't run it), and a `guard-macos` job asserting `/bin/bash ./repoknife --version` exits 1 with `requires bash >= 4.4`.
-- `.github/workflows/release.yml` — on push to **main** (the develop→main merge commit): extracts `VERSION` (repoknife:23), skips if tag `vX.Y.Z` already exists (idempotent re-merge), re-runs the checks, tags + publishes a GitHub Release with `repoknife` + `repoknife.sha256`, then `bump-tap` (decoupled job) bumps the formula via `mislav/bump-homebrew-formula-action@v3` using the `HOMEBREW_TAP_TOKEN` secret (classic PAT, `repo`+`workflow`).
+- `.github/workflows/ci.yml` — on PRs to develop/main + push to develop: `shellcheck` (pinned release binary, `shellcheck repoknife`), `actionlint` (pinned, lints the workflow YAML + their embedded `run:` shell), `_selftest` on ubuntu (native bash 5) and macos (brew bash — system 3.2 can't run it), and a `guard-macos` job asserting `/bin/bash ./repoknife --version` exits 1 with `requires bash >= 4.4`.
+- `.github/workflows/release.yml` — on push to **main** (the develop→main merge commit): extracts `VERSION` (repoknife:23), skips if tag `vX.Y.Z` already exists (idempotent re-merge), re-runs the checks, tags + publishes a GitHub Release with `repoknife` + `repoknife.sha256`, then `bump-tap` (decoupled job) bumps the formula with a **plain script** (computes the tag-tarball sha256, `sed`-rewrites the formula `url`+`sha256`, pushes) using the `HOMEBREW_TAP_TOKEN` secret (classic PAT, `repo`+`workflow`) — replaced the `mislav/bump-homebrew-formula-action` which hit an HTTP 303 fetching the tarball.
 - `Makefile` — `make check` (selftest+shellcheck+guard) · `build` (dist/) · `install-dev` (the ~/Code symlink) · `install-brew-local` · `release-dry-run`. `dist/` and `dist-tap/` are gitignored.
 
 **Routine release**: bump `VERSION="X.Y.Z"` (repoknife:23) on a feature branch → squash-merge to develop → PR develop→main (**merge commit**) → release.yml fires. The version bump is the release trigger; the human owns it.
