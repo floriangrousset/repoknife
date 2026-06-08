@@ -6,10 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 driven by [Conventional Commits](https://www.conventionalcommits.org).
 
-## [Unreleased]
+## [1.7.0] - 2026-06-08
 
 ### Features
 
+- **release**: Automatic SemVer + CHANGELOG via git-cliff; dev-aware --version ([`32a4989`](https://github.com/floriangrousset/repoknife/commit/32a4989edb67a78e3a9cc0f2f18d0e04c5fd4dbf))
 - Audit high-value tier — silent-failure reconciliation, sync fan-out, test coverage ([`d01a49d`](https://github.com/floriangrousset/repoknife/commit/d01a49d8e8c521b77a901a3830a0e309bc63b0c5))
 
 ### Bug Fixes
@@ -35,7 +36,7 @@ driven by [Conventional Commits](https://www.conventionalcommits.org).
 
 - Add CLAUDE.md dev guide and .gitignore ([`a42ad74`](https://github.com/floriangrousset/repoknife/commit/a42ad7425be93f162353657deec0f120d7c0c104))
 
-[unreleased]: https://github.com/floriangrousset/repoknife/compare/v1.6.0..HEAD
+[1.7.0]: https://github.com/floriangrousset/repoknife/compare/v1.6.0..v1.7.0
 
 [1.6.0]: https://github.com/floriangrousset/repoknife/releases/tag/v1.6.0
 
