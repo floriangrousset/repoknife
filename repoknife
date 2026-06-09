@@ -232,7 +232,10 @@ ui::menu() {  # $1=header, rest=options; echoes choice; rc 130 on cancel
     return 1
   fi
   local out rc=0
-  out="$(gum choose --height 14 --cursor "  ▸ " --cursor.foreground "$C_RED" \
+  # left-pad the whole component by 2 so gum's help footer (←↓↑→ navigate …) lands at
+  # the same indent as the items; the cursor drops its 2 leading spaces to compensate,
+  # so the items stay visually put. (--padding left-only avoids 80-col right-edge wrap.)
+  out="$(gum choose --height 14 --padding "0 0 0 2" --cursor "▸ " --cursor.foreground "$C_RED" \
         --header "$header" --header.foreground "$C_DIM" "$@")" || rc=$?
   [ $rc -ne 0 ] && return 130
   printf '%s' "$out"
@@ -523,7 +526,7 @@ disco::ado_projects_live() {  # $1=org → newline project names (cache-aware)
   ui::is_interactive || return 0                            # skip the NETWORK in plain/CI
   command -v az >/dev/null || return 0
   ado::auth_ok || return 0
-  out="$(ui::spin "Discovering ADO projects for $org…" "$SELF" __listprojects "$org")" || return 0
+  out="$(ui::spin "Discovering ADO projects for ${org}…" "$SELF" __listprojects "$org")" || return 0
   [ -z "$out" ] && return 0                                 # never cache a transient empty
   printf '%s\n' "$out" | cache::put azure-devops-projects "$org" ""
   printf '%s\n' "$out"
@@ -1656,7 +1659,7 @@ mod::pr() {
 mod::pr_actions() {  # $1=number $2=owner/repo
   local num="$1" nwo="$2"
   local meta base head
-  meta="$(ui::spin "Loading PR #$num…" gh pr view "$num" -R "$nwo" \
+  meta="$(ui::spin "Loading PR #${num}…" gh pr view "$num" -R "$nwo" \
           --json baseRefName,headRefName,title 2>/dev/null)" || meta="{}"
   base="$(jq -r '.baseRefName // "?"' <<< "$meta")"
   head="$(jq -r '.headRefName // "?"' <<< "$meta")"
@@ -1680,7 +1683,7 @@ mod::pr_actions() {  # $1=number $2=owner/repo
         if ! git::is_repo "$dir"; then
           if ui::confirm "$repo is not cloned locally — clone it now?" "Clone"; then
             mkdir -p "$(dirname "$dir")"
-            ui::spin "Cloning $nwo…" gh repo clone "$nwo" "$dir" || { ui::toast err "clone failed"; continue; }
+            ui::spin "Cloning ${nwo}…" gh repo clone "$nwo" "$dir" || { ui::toast err "clone failed"; continue; }
           else continue; fi
         fi
         # gh pr checkout writes to the CURRENT repo — must cd into the clone
@@ -1691,14 +1694,14 @@ mod::pr_actions() {  # $1=number $2=owner/repo
       *diff*)   ( gh pr diff "$num" -R "$nwo" --color always | less -R ) || true ;;
       *Approve*)
         local aerr
-        if aerr="$(ui::spin "Approving #$num…" gh pr review "$num" -R "$nwo" --approve 2>&1)"; then
+        if aerr="$(ui::spin "Approving #${num}…" gh pr review "$num" -R "$nwo" --approve 2>&1)"; then
           ui::toast ok "approved #$num"
         else fix::offer_gh_postmortem "$aerr" "approve failed"; fi
         ;;
       *Merge*)
         if ui::confirm "$stratlabel #$num into $base$delmsg?" "Merge"; then
           local merr
-          if merr="$(ui::spin "Merging #$num…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} 2>&1)"; then
+          if merr="$(ui::spin "Merging #${num}…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} 2>&1)"; then
             ui::toast ok "merged #$num into $base"; return 0
           else fix::offer_gh_postmortem "$merr" "merge failed (checks pending / not mergeable?)"; fi
         fi
@@ -1931,12 +1934,12 @@ mod::health_actions() {  # $1 = repo relpath
         fi ;;
       *status*)   ( git -C "$dir" -c color.status=always status | less -R ) || true ;;
       *Fetch*)
-        if ui::spin "Fetching $rel…" git -C "$dir" fetch --prune; then ui::toast ok "fetched"
+        if ui::spin "Fetching ${rel}…" git -C "$dir" fetch --prune; then ui::toast ok "fetched"
         else ui::toast err "fetch failed"; fi
         ;;
       *Pull*)
         if [ "$(git::dirty_count "$dir")" -gt 0 ]; then ui::toast warn "dirty working tree — skipped (commit or stash first)"
-        elif ui::spin "Pulling $rel…" git -C "$dir" pull --ff-only; then ui::toast ok "pulled"
+        elif ui::spin "Pulling ${rel}…" git -C "$dir" pull --ff-only; then ui::toast ok "pulled"
         else ui::toast err "pull failed (diverged?)"; fi
         ;;
       *develop*)
@@ -2059,7 +2062,7 @@ cleanup::sync_develop() {  # $1 = repo dir
   local src="origin/main"
   git -C "$dir" show-ref --verify --quiet refs/remotes/origin/main || src="main"
   [ "$src" = "main" ] && ! git::has_branch "$dir" main && { ui::toast err "no main branch"; return 1; }
-  if ui::spin "Syncing develop ← $src…" "$SELF" __syncdevelop "$dir" "$src"; then
+  if ui::spin "Syncing develop ← ${src}…" "$SELF" __syncdevelop "$dir" "$src"; then
     ui::toast ok "develop synced ← $src"
   else
     ui::toast err "sync failed (merge conflict? resolve manually)"
@@ -2652,6 +2655,12 @@ EOF
     "$(grep -E '^VERSION="[0-9]+\.[0-9]+\.[0-9]+"' "$REPOKNIFE_SELF" | head -1 | sed -E 's/^VERSION="([^"]+)".*/\1/')"
   t::check "bash guard string present" "yes" \
     "$(grep -q 'requires bash >= 4.4' "$REPOKNIFE_SELF" && echo yes || echo no)"
+  # guard the set -u/UTF-8 trap: a bare $var directly followed by a multibyte byte
+  # (a $var butted against the ellipsis) makes bash fold the byte into the name →
+  # unbound-variable abort. Always brace it: dollar-brace-var-brace then the ellipsis.
+  # (perl is portable; BSD grep lacks -P, and [^ -~] would also flag legit TABs.)
+  t::check "no bare \$var before a multibyte byte (set -u/UTF-8 trap)" "0" \
+    "$(LC_ALL=C perl -ne '$n++ while /\$[A-Za-z_]\w*[^\x00-\x7f]/g; END{print $n+0}' "$REPOKNIFE_SELF")"
 
   # --- code_root: path::expand_tilde + cfg::bootstrap resolution ---
   # shellcheck disable=SC2088  # '~' / '~/x' are deliberate literal inputs to the expander under test
