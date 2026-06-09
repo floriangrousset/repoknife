@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 driven by [Conventional Commits](https://www.conventionalcommits.org).
 
+## [1.8.0] - 2026-06-09
+
+### Features
+
+- **sync**: Auto-discover Azure DevOps projects & orgs via az ([`af5a910`](https://github.com/floriangrousset/repoknife/commit/af5a9100cd49e25ceacb045504a8135af1628951))
+
+### Bug Fixes
+
+- **sync**: Stop --version leaking Homebrew's git describe; warn on failed ADO live discovery ([`75db444`](https://github.com/floriangrousset/repoknife/commit/75db4448299a5d1c84116a91ae02ad039d101675))
+
+### CI & Build
+
+- **release**: Retry transient network fetches in the release pipeline ([`d758836`](https://github.com/floriangrousset/repoknife/commit/d758836ad9846c9249028459dae6e577f6c7eed1))
+
 ## [1.7.0] - 2026-06-08
 
 ### Features
@@ -35,6 +49,8 @@ driven by [Conventional Commits](https://www.conventionalcommits.org).
 ### Documentation
 
 - Add CLAUDE.md dev guide and .gitignore ([`a42ad74`](https://github.com/floriangrousset/repoknife/commit/a42ad7425be93f162353657deec0f120d7c0c104))
+
+[1.8.0]: https://github.com/floriangrousset/repoknife/compare/v1.7.0..v1.8.0
 
 [1.7.0]: https://github.com/floriangrousset/repoknife/compare/v1.6.0..v1.7.0
 
