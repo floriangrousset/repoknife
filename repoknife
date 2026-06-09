@@ -507,6 +507,49 @@ disco::ado_projects() {  # $1=org → folder projects + config ado_project_map e
   } | sort -u
 }
 
+# disco::ado_projects_live $1=org → ADO projects discovered LIVE via `az`, cached
+# (azure-devops-projects namespace, TTL'd, --refresh-busted). ALWAYS rc0 + empty on
+# ANY failure (no az / unauthed / network / ESC) so the picker falls back to
+# folders+config. The ONLY network path is the ui::spin worker — and it runs in the
+# MAIN shell (the picker hoists this into a $() before unioning), never a process
+# substitution, and only after ado::ensure_auth already validated auth at mod::sync.
+disco::ado_projects_live() {  # $1=org → newline project names (cache-aware)
+  local org="$1" out
+  [ -n "${REPOKNIFE_NO_DISCOVER:-}" ] && return 0          # hard offline switch (tests / opt-out)
+  [ "${REFRESH:-0}" -eq 1 ] && cache::invalidate azure-devops-projects "$org" ""
+  if out="$(cache::get azure-devops-projects "$org" "" 2>/dev/null)"; then
+    printf '%s\n' "$out"; return 0                          # cache read is safe in any mode
+  fi
+  ui::is_interactive || return 0                            # skip the NETWORK in plain/CI
+  command -v az >/dev/null || return 0
+  ado::auth_ok || return 0
+  out="$(ui::spin "Discovering ADO projects for $org…" "$SELF" __listprojects "$org")" || return 0
+  [ -z "$out" ] && return 0                                 # never cache a transient empty
+  printf '%s\n' "$out" | cache::put azure-devops-projects "$org" ""
+  printf '%s\n' "$out"
+}
+
+# disco::ado_orgs_live (no arg) → ADO orgs discovered LIVE via the vssps accounts
+# API, cached (azure-devops-orgs/self namespace). Same all-failures-yield-empty
+# contract and main-shell/worker discipline as disco::ado_projects_live. Org
+# discovery is best-effort — it returns nothing on tenants that block the accounts
+# API, in which case the picker uses folders + extra_orgs_azure-devops.
+disco::ado_orgs_live() {  # → newline org names (cache-aware)
+  local out
+  [ -n "${REPOKNIFE_NO_DISCOVER:-}" ] && return 0
+  [ "${REFRESH:-0}" -eq 1 ] && cache::invalidate azure-devops-orgs self ""
+  if out="$(cache::get azure-devops-orgs self "" 2>/dev/null)"; then
+    printf '%s\n' "$out"; return 0
+  fi
+  ui::is_interactive || return 0
+  command -v az >/dev/null || return 0
+  ado::auth_ok || return 0
+  out="$(ui::spin "Discovering ADO organizations…" "$SELF" __listorgs)" || return 0
+  [ -z "$out" ] && return 0
+  printf '%s\n' "$out" | cache::put azure-devops-orgs self ""
+  printf '%s\n' "$out"
+}
+
 # disco::local_repos [provider] → relpaths (provider/org[/project]/repo) of git repos
 # at the exact repo-arity depth; never descends into a found repo; skips dotdirs.
 disco::local_repos() {
@@ -670,6 +713,15 @@ provider_github_create_repo() {  # $1=org $2=repo $3=local-dir $4=private|public
 provider_github_repo_url() { printf 'https://github.com/%s/%s' "$1" "$2"; }
 
 # ------------------------------------------------------------ azure devops (az)
+# normalized discovery jq filters, held in constants so the selftest can run the
+# REAL producer on canned JSON (filter/selftest drift is the classic regression).
+# Both sanitize remote strings (gsub cntrl) — terminal-injection defense.
+JQ_ADO_PROJECTS='.value[]? | (.name // empty) | gsub("[[:cntrl:]]";" ")'
+JQ_ADO_ORGS='.value[]? | (.accountName // empty) | gsub("[[:cntrl:]]";" ")'
+# Azure DevOps AAD application id — the audience for `az rest` tokens against the
+# vssps profile/accounts APIs (org discovery). A fixed, well-known GUID.
+ADO_RESOURCE_ID='499b84ac-1321-427f-aa17-267ca6975798'
+
 ado::org_url() { printf 'https://dev.azure.com/%s/' "$1"; }
 
 ado::auth_ok() {  # never run az interactively inside a spinner — pre-check here
@@ -709,6 +761,32 @@ provider_azure_devops_clone_repo() {  # $1=org $2=repo $3=target-dir $4=clone-ur
 }
 
 provider_azure_devops_repo_url() { printf 'https://dev.azure.com/%s/%s/_git/%s' "$1" "$3" "$2"; }
+
+provider_azure_devops_list_projects() {  # $1=org → newline project names
+  local org="$1"
+  ado::auth_ok || { log::err "Azure DevOps not authenticated. Run: az login"; return 2; }
+  # AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no: a missing azure-devops extension errors
+  # cleanly (→ empty → caller falls back) instead of prompting inside the worker.
+  AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no \
+    az devops project list --organization "$(ado::org_url "$org")" --only-show-errors -o json \
+  | jq -r "$JQ_ADO_PROJECTS"
+}
+
+provider_azure_devops_list_orgs() {  # (no arg) → newline org (accountName) names
+  local me
+  ado::auth_ok || { log::err "Azure DevOps not authenticated. Run: az login"; return 2; }
+  # vssps profile → memberId, then accounts → orgs. Uses the ADO resource token via
+  # `az rest` (NOT MS Graph / `az ad signed-in-user`, which is often blocked on
+  # guest/restricted tenants). Any empty/failed step → non-zero (caller degrades).
+  me="$(az rest --resource "$ADO_RESOURCE_ID" --only-show-errors \
+        --url 'https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1' \
+        -o json 2>/dev/null | jq -r '.id // empty')"
+  [ -n "$me" ] || return 1
+  az rest --resource "$ADO_RESOURCE_ID" --only-show-errors \
+     --url "https://app.vssps.visualstudio.com/_apis/accounts?memberId=${me}&api-version=7.1" \
+     -o json 2>/dev/null \
+  | jq -r "$JQ_ADO_ORGS"
+}
 
 # ------------------------------------------------------------------ gitlab stub
 gitlab::stub() {
@@ -1092,8 +1170,13 @@ mod::pick_org() {  # $1=provider → SEL ; fzf picker with type-to-search
   SEL="" SEL_WAS_MENU=0
   local provider="$1"
   if [ -n "$ARG_ORG" ]; then SEL="$ARG_ORG"; return 0; fi
-  local orgs=() o
-  while IFS= read -r o; do orgs+=("$o"); done < <(disco::orgs "$provider")
+  local orgs=() o live=""
+  # azure-devops: union LIVE org discovery (vssps accounts API, cached) with the
+  # offline source (folders + extra_orgs_azure-devops). The spinner-bearing live
+  # fetch is hoisted into a $() in the MAIN shell; the proc-sub only merges text.
+  [ "$provider" = "azure-devops" ] && live="$(disco::ado_orgs_live)"
+  while IFS= read -r o; do [ -n "$o" ] && orgs+=("$o"); done \
+       < <( { printf '%s\n' "$live"; disco::orgs "$provider"; } | sort -u )
   [ "${#orgs[@]}" -eq 0 ] && { log::err "no orgs found for $provider (add folders or config extra_orgs_$provider)"; return 1; }
   if [ "${#orgs[@]}" -eq 1 ]; then SEL="${orgs[0]}"; return 0; fi
   if ! ui::is_interactive; then log::err "multiple orgs — pass one with --org"; return 1; fi
@@ -1118,9 +1201,23 @@ mod::pick_org() {  # $1=provider → SEL ; fzf picker with type-to-search
 
 mod::pick_ado_project() {  # $1=org → SEL ; fzf picker with type-to-search
   SEL="" SEL_WAS_MENU=0
-  local org="$1" projects=() p
-  while IFS= read -r p; do projects+=("$p"); done < <(disco::ado_projects "$org")
-  [ "${#projects[@]}" -eq 0 ] && { log::err "no ADO project known for '$org' — set config ado_project_map=$org:<project>"; return 1; }
+  local org="$1" projects=() p live offline
+  # union LIVE discovery (az devops project list, cached) with the offline source
+  # (folders + ado_project_map). The spinner-bearing live fetch is hoisted into a
+  # $() in the MAIN shell — NEVER inside the process substitution (gum spin in a
+  # proc-sub corrupts the TTY); the proc-sub below only merges plain text.
+  live="$(disco::ado_projects_live "$org")"
+  offline="$(disco::ado_projects "$org")"
+  # live empty in an interactive, authed session means discovery FAILED — not "no
+  # projects". Warn so the user isn't silently dropped into the one locally-known
+  # project (the classic "I only see Orchestra" trap) with no idea discovery broke.
+  if [ -z "$live" ] && [ -z "${REPOKNIFE_NO_DISCOVER:-}" ] && ui::is_interactive \
+     && command -v az >/dev/null && ado::auth_ok; then
+    log::warn "live ADO project discovery returned nothing for '$org' — showing only locally-known projects (check the 'azure-devops' az extension · az login · network; --refresh to retry)"
+  fi
+  while IFS= read -r p; do [ -n "$p" ] && projects+=("$p"); done \
+       < <(printf '%s\n%s\n' "$live" "$offline" | sort -u)
+  [ "${#projects[@]}" -eq 0 ] && { log::err "no ADO project found for '$org' — check 'az login' / the org name, or set ado_project_map=$org:<project>"; return 1; }
   if [ "${#projects[@]}" -eq 1 ]; then SEL="${projects[0]}"; return 0; fi
   if ! ui::is_interactive; then log::err "multiple ADO projects for '$org' — set config ado_project_map"; return 1; fi
   local locals rows=() r n
@@ -2037,8 +2134,10 @@ ${H}  CONCEPTS${R}
                         are never auto-deleted${R}
     Code root           ${D}~/Code by default · set via config code_root · REPOKNIFE_CODE_ROOT env wins${R}
     Config file         ${D}~/.repoknife.conf (installed) · the repo-adjacent .repoknife.conf (dev runs)${R}
-    Orgs                ${D}auto-discovered from folders ∪ config extra_orgs_* keys${R}
-    Cache               ${D}remote repo lists cached 1h in ~/.cache/repoknife — bypass with --refresh${R}
+    Orgs                ${D}folders ∪ config extra_orgs_* ∪ (Azure DevOps) live az discovery${R}
+    ADO projects        ${D}auto-discovered via az devops project list when signed in (az login) ·
+                        ado_default_org / ado_project_map are now optional offline fallbacks${R}
+    Cache               ${D}remote repo + ADO project/org lists cached 1h in ~/.cache/repoknife — bypass with --refresh${R}
 
 ${H}  KEYS — every list screen${R}
     ${G}type to search${R}      ${D}fuzzy filter as you type (fzf) — no prefix key needed${R}
@@ -2070,7 +2169,8 @@ ${H}  TROUBLESHOOTING${R}
                         --plain mode the exact command is printed instead${R}
     gh not authed       ${D}gh auth login${R}
     Actions re-run 403  ${D}gh auth refresh -s workflow   (token needs the workflow scope)${R}
-    Azure DevOps        ${D}az login   (az missing → brew install azure-cli)${R}
+    Azure DevOps        ${D}az login   (az missing → brew install azure-cli) ·
+                        project/org auto-discovery needs the azure-devops az extension${R}
     Missing tools       ${D}brew install <tool>   (offered on startup)${R}
     Commit signing      ${D}check git config user.signingkey + gpg.format
                         macOS: ssh-add --apple-load-keychain${R}
@@ -2293,6 +2393,10 @@ ver::print() {  # `--version`: always "repoknife X.Y.Z" (line 1, kept stable for
   local dir desc br
   dir="$(dirname "$SELF")"
   git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  # only annotate when THIS script is tracked by that repo — otherwise we're inside
+  # an unrelated ENCLOSING checkout (e.g. a brew install under /opt/homebrew, which
+  # is itself a git repo) and would leak ITS describe/branch (e.g. "5.1.15 · stable").
+  git -C "$dir" ls-files --error-unmatch -- "$SELF" >/dev/null 2>&1 || return 0
   desc="$(git -C "$dir" describe --tags --always --dirty 2>/dev/null || true)"
   br="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   [ -n "$desc" ] && printf '  build  %s%s\n' "$desc" "${br:+ · $br}"
@@ -2367,6 +2471,10 @@ cli::parse_args() {
 # hidden helper: normalized repo list (used inside ui::spin so output is capturable)
 cli::__list() { provider::dispatch "$1" list_repos "$2" ${3:+"$3"}; }
 
+# hidden helpers: live ADO discovery (run inside ui::spin so output is capturable)
+cli::__listprojects() { provider::dispatch azure-devops list_projects "$1"; }
+cli::__listorgs()     { provider::dispatch azure-devops list_orgs; }
+
 # hidden helper: fanout a worker verb over stdin items (used inside ui::spin)
 cli::__fanout() { worker::fanout "$1"; }
 
@@ -2432,6 +2540,8 @@ cli::dispatch() {
     # --- hidden fast-paths: no banner/deps/auth cost --------------------------
     _worker)        PLAIN=1; palette::init; worker::entry "${CMD_ARGS[@]}"; exit 0 ;;
     __list)         palette::init; cfg::load; cfg::bootstrap; cli::__list "${CMD_ARGS[@]}"; exit $? ;;
+    __listprojects) palette::init; cfg::load; cfg::bootstrap; cli::__listprojects "${CMD_ARGS[@]}"; exit $? ;;
+    __listorgs)     palette::init; cfg::load; cfg::bootstrap; cli::__listorgs; exit $? ;;
     __fanout)       palette::init; cfg::load; cfg::bootstrap; cli::__fanout "${CMD_ARGS[@]}"; exit $? ;;
     __initscan)     palette::init; disco::init_candidates; exit 0 ;;
     __prfetch)      pr::fetch "${CMD_ARGS[0]:-all}"; exit $? ;;
@@ -2583,6 +2693,23 @@ EOF
     "azure-devops/corp/Proj/scratch github/acme/plainfolder" \
     "$(disco::init_candidates | sort | tr '\n' ' ' | sed 's/ $//')"
 
+  # --- live ADO discovery wrappers (cache-aware; hermetic via a SEEDED cache — the
+  #     non-interactive selftest never reaches the network path, and a guard env
+  #     forces empty for defense-in-depth) ---
+  mkdir -p "$fix/adocache"
+  { printf '#fetched_at=%s\n' "$(date +%s)"; printf 'Apex\nBilling\nOrchestra\n'; } \
+    > "$fix/adocache/azure-devops-projects__globalgig-devops.tsv"
+  { printf '#fetched_at=%s\n' "$(date +%s)"; printf 'globalgig-devops\nflorian-grousset\n'; } \
+    > "$fix/adocache/azure-devops-orgs__self.tsv"
+  t::check "ado projects live (cache hit)" "Apex Billing Orchestra" \
+    "$(CACHE_DIR="$fix/adocache" EXCLUDE_FORKS=0 REFRESH=0 disco::ado_projects_live globalgig-devops | tr '\n' ' ' | sed 's/ $//')"
+  t::check "ado orgs live (cache hit)" "florian-grousset globalgig-devops" \
+    "$(CACHE_DIR="$fix/adocache" EXCLUDE_FORKS=0 REFRESH=0 disco::ado_orgs_live | sort | tr '\n' ' ' | sed 's/ $//')"
+  t::check "ado projects live guarded empty" "" \
+    "$(CACHE_DIR="$fix/adocache" EXCLUDE_FORKS=0 REFRESH=0 REPOKNIFE_NO_DISCOVER=1 disco::ado_projects_live globalgig-devops)"
+  t::check "ado orgs live guarded empty" "" \
+    "$(CACHE_DIR="$fix/adocache" EXCLUDE_FORKS=0 REFRESH=0 REPOKNIFE_NO_DISCOVER=1 disco::ado_orgs_live)"
+
   # --- provider dispatch ---
   provider::dispatch github bogus_verb 2>/dev/null && t::check "dispatch missing verb" "rc1" "rc0" \
     || t::check "dispatch missing verb" "rc1" "rc1"
@@ -2623,6 +2750,10 @@ EOF
   t::check "cache key slash to _"   "$fix/c/github__a_b_c__x.tsv"   "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github 'a/b/c' 'x')"
   t::check "cache key no traversal" "$fix/c/github__.._.._etc.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github '../../etc' '')"
   t::check "cache key fork suffix"  "$fix/c/github__o__nofork.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=1 cache::file github o '')"
+  # live-discovery cache namespaces (fork suffix still appended under --no-forks — harmless duplication, locked here)
+  t::check "cache key ado projects ns"   "$fix/c/azure-devops-projects__globalgig-devops.tsv"  "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file azure-devops-projects 'globalgig-devops' '')"
+  t::check "cache key ado projects fork" "$fix/c/azure-devops-projects__o__nofork.tsv"          "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=1 cache::file azure-devops-projects o '')"
+  t::check "cache key ado orgs ns"       "$fix/c/azure-devops-orgs__self.tsv"                   "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file azure-devops-orgs self '')"
 
   # --- TSV producer schemas (lock the 8-col repo-list & 7-col runs against drift) ---
   if command -v jq >/dev/null; then
@@ -2632,6 +2763,11 @@ EOF
       "$(printf '%s' '[{"name":"r","isFork":false,"isArchived":false,"isEmpty":false,"defaultBranchRef":null,"pushedAt":"-","sshUrl":"u","description":"d\u0007e"}]' | jq -r "$JQ_REPO_LIST" | cut -f8)"
     t::check "runs TSV cols" "7" \
       "$(printf '%s' '[{"databaseId":1,"status":"completed","conclusion":"success","displayTitle":"t","workflowName":"w","headBranch":"b","createdAt":"2024-01-01T00:00:00Z"}]' | jq -r --arg r 'o/r' "$JQ_RUNS" | awk -F'\t' '{print NF; exit}')"
+    # live-discovery producers: one name per line, control chars sanitized
+    t::check "ado-projects names+cntrl" "2:a b" \
+      "$(printf '%s' '{"value":[{"name":"Orchestra"},{"name":"a\u0007b"}]}' | jq -r "$JQ_ADO_PROJECTS" | awk 'NR==2{s=$0} END{print NR":"s}')"
+    t::check "ado-orgs names+cntrl" "2:x y" \
+      "$(printf '%s' '{"value":[{"accountName":"corp"},{"accountName":"x\u0007y"}]}' | jq -r "$JQ_ADO_ORGS" | awk 'NR==2{s=$0} END{print NR":"s}')"
   fi
 
   # --- worker dry/dispatch branches (pure) ---
