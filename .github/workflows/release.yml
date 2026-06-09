@@ -31,7 +31,7 @@ jobs:
       - name: install git-cliff (pinned)
         run: |
           ver=2.13.1
-          curl -fsSL "https://github.com/orhun/git-cliff/releases/download/v${ver}/git-cliff-${ver}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
+          curl -fsSL --retry 3 --retry-delay 2 "https://github.com/orhun/git-cliff/releases/download/v${ver}/git-cliff-${ver}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
           echo "$PWD/git-cliff-${ver}" >> "$GITHUB_PATH"
           "git-cliff-${ver}/git-cliff" --version
 
@@ -70,7 +70,7 @@ jobs:
         if: steps.bump.outputs.released == 'true'
         run: |
           sc=v0.10.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${sc}/shellcheck-${sc}.linux.x86_64.tar.xz" | tar -xJ
+          curl -fsSL --retry 3 --retry-delay 2 "https://github.com/koalaman/shellcheck/releases/download/${sc}/shellcheck-${sc}.linux.x86_64.tar.xz" | tar -xJ
           "shellcheck-${sc}/shellcheck" repoknife
           ./repoknife _selftest
           grep -q 'requires bash >= 4.4' repoknife || { echo "guard string missing" >&2; exit 1; }
@@ -140,7 +140,10 @@ jobs:
           set -euo pipefail
           tag="v$VERSION"
           url="https://github.com/floriangrousset/repoknife/archive/refs/tags/$tag.tar.gz"
-          sha="$(curl -fsSL "$url" | sha256sum | awk '{print $1}')"
+          # GitHub generates the tag tarball on demand — it can 404/redirect for a few
+          # seconds right after the tag is created. Retry on ALL errors so the formula
+          # bump doesn't fail on that transient window (the old action's "HTTP 303").
+          sha="$(curl -fsSL --retry 6 --retry-delay 3 --retry-all-errors "$url" | sha256sum | awk '{print $1}')"
           echo "tarball sha256: $sha"
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/floriangrousset/homebrew-tap.git" tap
           cd tap
