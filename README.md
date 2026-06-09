@@ -18,12 +18,12 @@ repo bootstrapping — built on `gum` + `fzf` + `gh`.
 | Module | |
 |---|---|
 | ✨ **Init** | turn plain folders into gitflow repos (`main` + `develop`, develop default) with optional GitHub remote creation |
-| 🔁 **Sync** | fetch an org's remote repo list, multi-select, batch clone/pull with live git progress — dirty repos are skipped, never touched |
+| 🔁 **Sync** | fetch an org's remote repo list, multi-select, batch clone/pull with live git progress — dirty repos are skipped, never touched. Azure DevOps orgs & projects are auto-discovered live via `az` |
 | 🔀 **PRs** | cross-org PR dashboard (authored / review-requested / assigned / mentioned) with checkout, diff, approve, merge — merge strategy follows gitflow (squash→develop, merge-commit→main) |
 | 🤖 **Actions** | recent workflow runs across repos — watch live, re-run failed, failure logs |
 | 💚 **Health** | every local repo, worst-first: dirty, diverged, behind/ahead, gone branches, missing develop — with one-keystroke fixes |
 | 🧹 **Cleanup** | delete `[gone]`/`[merged]` branches (`main`/`develop`/current always protected), sync develop ← main |
-| 🔧 **Config** | extra orgs, Azure DevOps org→project map, repo-create visibility, fork filter |
+| 🔧 **Config** | extra orgs, optional Azure DevOps org→project map (offline fallback), repo-create visibility, fork filter |
 
 Run bare for the interactive menu, or script it: every module is a subcommand
 (`repoknife health --plain`, `repoknife sync --org acme --dry-run`, …) with a
@@ -70,8 +70,12 @@ For example, with the default `~/Code`:
 - 🟨 **project** — the third level: Azure DevOps project · GitLab subgroup (repos without one go in a literal `No Project/` folder)
 - 🟩 **repo** — the git clones themselves
 
-Orgs are auto-discovered from these folders plus config. The code root needs no
-special marker — it's just the folder that holds your `github/` · `gitlab/` ·
+Orgs are auto-discovered from these folders plus config. For **Azure DevOps**,
+signing in with `az login` additionally auto-discovers your organizations and
+each org's projects live (via `az devops project list` and the vssps accounts
+API) — so the `ado_default_org` / `ado_project_map` config keys are now optional
+offline fallbacks rather than required setup. The code root needs no special
+marker — it's just the folder that holds your `github/` · `gitlab/` ·
 `azure-devops/` trees.
 
 ## Install
@@ -118,8 +122,10 @@ A dev run (`./repoknife`, or the `~/Code/repoknife` symlink) reads the
 repo-adjacent `.repoknife.conf`, keeping dev config separate from your installed
 `~/.repoknife.conf`.
 
-Optional: `az` CLI for Azure DevOps · `lazygit` for the health-screen shortcut ·
-`gh auth refresh -s workflow` to enable re-running failed Actions jobs.
+Optional: `az` CLI for Azure DevOps (with the `azure-devops` extension —
+`az extension add --name azure-devops` — for live project/org discovery) ·
+`lazygit` for the health-screen shortcut · `gh auth refresh -s workflow` to
+enable re-running failed Actions jobs.
 
 ## Notes
 
