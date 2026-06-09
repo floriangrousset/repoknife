@@ -20,7 +20,7 @@ fi
 
 set -Eeuo pipefail
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 # --- self-location (resolves symlinks; CODE_ROOT = dir the script lives in) ---
 SELF="${BASH_SOURCE[0]}"

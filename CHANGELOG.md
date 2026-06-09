@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 driven by [Conventional Commits](https://www.conventionalcommits.org).
 
+## [1.8.1] - 2026-06-09
+
+### Bug Fixes
+
+- **ui**: Brace $var before the … ellipsis in spinner titles (set -u/UTF-8 crash); align menu help footer ([`9d65f61`](https://github.com/floriangrousset/repoknife/commit/9d65f61d8e231db1cf1e79167335855e77e97982))
+
 ## [1.8.0] - 2026-06-09
 
 ### Features
@@ -49,6 +55,8 @@ driven by [Conventional Commits](https://www.conventionalcommits.org).
 ### Documentation
 
 - Add CLAUDE.md dev guide and .gitignore ([`a42ad74`](https://github.com/floriangrousset/repoknife/commit/a42ad7425be93f162353657deec0f120d7c0c104))
+
+[1.8.1]: https://github.com/floriangrousset/repoknife/compare/v1.8.0..v1.8.1
 
 [1.8.0]: https://github.com/floriangrousset/repoknife/compare/v1.7.0..v1.8.0
 
