@@ -13,25 +13,41 @@ name: release
 on:
   push:
     branches: [main]
+  # re-drive the tap bump for an ALREADY-published release (a failed bump-tap
+  # can't re-run via push: the release gate sees the Release and skips)
+  workflow_dispatch:
+    inputs:
+      tap-version:
+        description: 'Existing release version to re-bump the tap to (X.Y.Z, no v)'
+        required: true
 
 permissions:
   contents: write   # tag, release, and push the version+changelog bump back
 
+# never let two main-pushes interleave a release (bump/tag/publish is multi-step)
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
       released: ${{ steps.bump.outputs.released }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4.3.1 (SHA-pinned: this job holds contents:write)
         with:
           fetch-depth: 0   # full history + tags for git-cliff's version/changelog
 
-      - name: install git-cliff (pinned)
+      - name: install git-cliff (pinned + checksummed)
         run: |
           ver=2.13.1
-          curl -fsSL --retry 3 --retry-delay 2 "https://github.com/orhun/git-cliff/releases/download/v${ver}/git-cliff-${ver}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
+          sha256=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+          curl -fsSL --retry 3 --retry-delay 2 -o git-cliff.tar.gz "https://github.com/orhun/git-cliff/releases/download/v${ver}/git-cliff-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$sha256  git-cliff.tar.gz" | sha256sum -c -
+          tar -xzf git-cliff.tar.gz
           echo "$PWD/git-cliff-${ver}" >> "$GITHUB_PATH"
           "git-cliff-${ver}/git-cliff" --version
 
@@ -63,6 +79,9 @@ jobs:
           VER: ${{ steps.bump.outputs.version }}
         run: |
           sed -i -E "s/^VERSION=\"[^\"]+\"/VERSION=\"$VER\"/" repoknife
+          # assert the sed bit — a silent no-op would ship a release whose
+          # script still reports the previous version
+          grep -q "^VERSION=\"$VER\"" repoknife || { echo "VERSION sed did not apply" >&2; exit 1; }
           grep -E '^VERSION=' repoknife
           git-cliff --bump -o CHANGELOG.md
 
@@ -70,7 +89,10 @@ jobs:
         if: steps.bump.outputs.released == 'true'
         run: |
           sc=v0.10.0
-          curl -fsSL --retry 3 --retry-delay 2 "https://github.com/koalaman/shellcheck/releases/download/${sc}/shellcheck-${sc}.linux.x86_64.tar.xz" | tar -xJ
+          sha256=6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+          curl -fsSL --retry 3 --retry-delay 2 -o shellcheck.tar.xz "https://github.com/koalaman/shellcheck/releases/download/${sc}/shellcheck-${sc}.linux.x86_64.tar.xz"
+          echo "$sha256  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
           "shellcheck-${sc}/shellcheck" repoknife
           ./repoknife _selftest
           grep -q 'requires bash >= 4.4' repoknife || { echo "guard string missing" >&2; exit 1; }
@@ -98,8 +120,13 @@ jobs:
           # idempotent: if a prior partial run already pushed this bump to main, reuse it
           # (so a re-run after a failed publish can't non-fast-forward main); else commit it.
           if git show "origin/main:repoknife" 2>/dev/null | grep -q "^VERSION=\"$VER\""; then
-            echo "origin/main already bumped to $VER — reusing it"
-            sha="$(git rev-parse origin/main)"
+            # find the actual bump COMMIT — tagging the tip of main would scoop
+            # up anything that landed since the half-done run
+            sha="$(git log origin/main --grep="^chore(release): $TAG" --format=%H -1)"
+            [ -n "$sha" ] || sha="$(git rev-parse origin/main)"
+            git show "$sha:repoknife" | grep -q "^VERSION=\"$VER\"" \
+              || { echo "could not locate the $TAG bump commit on main" >&2; exit 1; }
+            echo "origin/main already bumped to $VER — tagging $sha"
           else
             git add repoknife CHANGELOG.md
             git commit -qm "chore(release): $TAG [skip ci]"
@@ -125,8 +152,12 @@ jobs:
 
   bump-tap:
     needs: release
-    if: needs.release.outputs.released == 'true'
+    # always(): on workflow_dispatch the release job is skipped, which would
+    # otherwise auto-skip this dependent job too
+    if: always() && (needs.release.outputs.released == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read   # pushes via TAP_TOKEN only — no GITHUB_TOKEN write needed
     steps:
       # Plain script instead of a third-party action: deterministic, no Node
       # deprecation, and avoids the "unexpected HTTP 303" the bump action hit
@@ -135,9 +166,13 @@ jobs:
       - name: bump formula in the tap
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ needs.release.outputs.version }}
+          VERSION: ${{ needs.release.outputs.version || inputs.tap-version }}
         run: |
           set -euo pipefail
+          # VERSION comes from the release job OR a manual dispatch input —
+          # enforce the X.Y.Z shape before it reaches curl/sed
+          printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "bad version: '$VERSION'" >&2; exit 1; }
           tag="v$VERSION"
           url="https://github.com/floriangrousset/repoknife/archive/refs/tags/$tag.tar.gz"
           # GitHub generates the tag tarball on demand — it can 404/redirect for a few
@@ -150,6 +185,10 @@ jobs:
           f="Formula/repoknife.rb"
           sed -i -E "s#^  url \".*\"#  url \"$url\"#" "$f"
           sed -i -E "s#^  sha256 \".*\"#  sha256 \"$sha\"#" "$f"
+          # assert the rewrites bit — "sed stopped matching" must not be
+          # conflated with "already bumped" by the diff check below
+          grep -qF "url \"$url\"" "$f" || { echo "formula url rewrite failed" >&2; exit 1; }
+          grep -qF "sha256 \"$sha\"" "$f" || { echo "formula sha256 rewrite failed" >&2; exit 1; }
           if git diff --quiet; then echo "formula already at $VERSION — nothing to do"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
