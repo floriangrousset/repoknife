@@ -203,8 +203,12 @@ ui::cols() { tput cols 2>/dev/null || echo 80; }
 
 # Full ANSI/control strip for plain-mode output: OSC (title/clipboard), all CSI
 # (not just SGR colors), then residual control bytes. BSD-sed safe via $'' ESC.
+# The CSI command uses a ',' delimiter so the intermediate-byte class can be the
+# literal range [ -/] (0x20-0x2F): with the '/' delimiter it had to be escaped
+# as [ -\/], which brackets parse as space-through-BACKSLASH — that wrongly
+# spans digits/uppercase and ate printable text after cursor-movement CSIs.
 ui::strip_ansi() {
-  LC_ALL=C sed -E $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)?//g; s/\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' \
+  LC_ALL=C sed -E $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)?//g; s,\x1b\\[[0-9;?]*[ -/]*[@-~],,g' \
     | LC_ALL=C tr -d '\000-\010\013\014\016-\037'
 }
 
@@ -262,6 +266,22 @@ ui::spin() {  # $1=title, rest = command; captures stdout; rc = command rc
   else
     printf '%s\n' "$title" >&2
     "$@"
+  fi
+}
+
+ui::spin_err() {  # $1=errfile $2=title, rest = command — the COMMAND's stderr
+  # goes to the file. NEVER capture ui::spin with 2>&1 instead: gum renders the
+  # spinner on ITS stderr, so 2>&1 makes the spinner invisible and mixes its
+  # ANSI frames into the captured error text.
+  local errf="$1" title="$2"; shift 2
+  if ui::is_interactive; then
+    # shellcheck disable=SC2016  # $1/$@ deliberately expand in the INNER bash
+    gum spin --spinner dot --spinner.foreground "$C_CYAN" \
+      --title "$title" --show-output -- \
+      bash -c 'exec 2>"$1"; shift; exec "$@"' _ "$errf" "$@"
+  else
+    printf '%s\n' "$title" >&2
+    "$@" 2>"$errf"
   fi
 }
 
@@ -453,6 +473,11 @@ path::parse() {
 path::repo_dir() {  # $1=provider $2=org $3=project(or "") $4=repo → abs path
   if [ -n "$3" ]; then printf '%s/%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$3" "$4"
   else printf '%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$4"; fi
+}
+
+org::valid() {  # org/account names: alnum . _ - and NOT starting with '-'
+  # (a leading '-' would reach `gh repo list "$org"` looking like a flag)
+  [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]]
 }
 
 path::expand_tilde() {  # $1=value; expand a leading ~ / ~/ to $HOME (no eval, no glob)
@@ -678,7 +703,7 @@ JQ_REPO_LIST='.[] | [
       (if .isEmpty then "1" else "0" end),
       (.defaultBranchRef.name // "-"),
       (.pushedAt // "-"),
-      .sshUrl,
+      (.sshUrl // "-"),
       ((.description // "") | gsub("[[:cntrl:]]"; " "))
     ] | @tsv'
 # ---------------------------------------------------------------- github (gh)
@@ -744,6 +769,18 @@ ado::ensure_auth() {  # interactive pre-check — call BEFORE any spinner/captur
              "az login" "ado::auth_ok" 2
 }
 
+# ADO repo-list jq → same 8-col TSV as JQ_REPO_LIST (constant so the selftest
+# schema-checks it; .name sanitized like every other remote-string ingestion)
+JQ_ADO_REPO_LIST='.[] | select(.isDisabled != true) | [
+      ((.name // "") | gsub("[[:cntrl:]]"; " ")),
+      "0", "0",
+      (if (.size // 0) == 0 then "1" else "0" end),
+      ((.defaultBranch // "-") | sub("^refs/heads/"; "")),
+      "-",
+      (.sshUrl // "-"),
+      ""
+    ] | @tsv'
+
 provider_azure_devops_list_repos() {  # $1=org $2=project
   local org="$1" project="$2"
   if ! ado::auth_ok; then
@@ -752,14 +789,7 @@ provider_azure_devops_list_repos() {  # $1=org $2=project
   fi
   az repos list --organization "$(ado::org_url "$org")" --project "$project" \
      --only-show-errors -o json \
-  | jq -r '.[] | select(.isDisabled != true) | [
-      .name, "0", "0",
-      (if (.size // 0) == 0 then "1" else "0" end),
-      ((.defaultBranch // "-") | sub("^refs/heads/"; "")),
-      "-",
-      .sshUrl,
-      ""
-    ] | @tsv'
+  | jq -r "$JQ_ADO_REPO_LIST"
 }
 
 provider_azure_devops_clone_repo() {  # $1=org $2=repo $3=target-dir $4=clone-url
@@ -773,8 +803,9 @@ provider_azure_devops_list_projects() {  # $1=org → newline project names
   ado::auth_ok || { log::err "Azure DevOps not authenticated. Run: az login"; return 2; }
   # AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no: a missing azure-devops extension errors
   # cleanly (→ empty → caller falls back) instead of prompting inside the worker.
+  # --top: the API serves ONE page by default — large orgs truncate silently
   AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no \
-    az devops project list --organization "$(ado::org_url "$org")" --only-show-errors -o json \
+    az devops project list --organization "$(ado::org_url "$org")" --top 500 --only-show-errors -o json \
   | jq -r "$JQ_ADO_PROJECTS"
 }
 
@@ -810,11 +841,12 @@ provider_gitlab_create_repo() { gitlab::stub; }
 #  TTL'd remote repo-list TSV per provider+org(+project) under ~/.cache/repoknife.
 #  First line: "#fetched_at=<epoch>" — body is the normalized TSV.
 #============================================================================
-cache::file() {  # $1=provider $2=org [$3=project] — fork-filter is part of the key
-  # sanitize path components: org/project come from config too ('/', '..' must not escape CACHE_DIR)
-  local org="${2//[^A-Za-z0-9._-]/_}" project="${3:-}"
+cache::file() {  # $1=provider/namespace $2=org [$3=project] — fork-filter is part of the key
+  # sanitize ALL path components: org/project come from config, and the provider
+  # reaches here from --provider — none may escape CACHE_DIR ('/', '..')
+  local prov="${1//[^A-Za-z0-9._-]/_}" org="${2//[^A-Za-z0-9._-]/_}" project="${3:-}"
   project="${project//[^A-Za-z0-9._-]/_}"
-  printf '%s/%s__%s%s%s.tsv' "$CACHE_DIR" "$1" "$org" "${project:+__$project}" \
+  printf '%s/%s__%s%s%s.tsv' "$CACHE_DIR" "$prov" "$org" "${project:+__$project}" \
     "$( [ "$EXCLUDE_FORKS" -eq 1 ] && printf '__nofork' )"
 }
 
@@ -1002,16 +1034,19 @@ JQ_RUNS='.[] | [
        elif .conclusion == "success" then "pass"
        elif .conclusion == "skipped" then "skipped"
        else "fail" end),
-      ((.workflowName // "") | gsub("[[:cntrl:]]"; " ")),
-      ((.headBranch // "") | gsub("[[:cntrl:]]"; " ")),
+      ((.workflowName // "") | gsub("[[:cntrl:]]"; " ") | if . == "" then "-" else . end),
+      ((.headBranch // "") | gsub("[[:cntrl:]]"; " ") | if . == "" then "-" else . end),
       .createdAt,
       ((.displayTitle // "") | gsub("[[:cntrl:]]"; " "))
     ] | @tsv'
 worker::do_runs() {
   local nwo="$1"
+  # gh failures must propagate (no 2>/dev/null, no || true): worker::entry then
+  # synthesizes the error row from gh's real stderr — that row is what makes the
+  # auth/rate-limit hint in mod::runs reachable at all
   gh run list -R "$nwo" --limit 5 \
-     --json databaseId,status,conclusion,displayTitle,workflowName,headBranch,createdAt 2>/dev/null \
-  | jq -r --arg r "$nwo" "$JQ_RUNS" || true
+     --json databaseId,status,conclusion,displayTitle,workflowName,headBranch,createdAt \
+  | jq -r --arg r "$nwo" "$JQ_RUNS"
 }
 
 # --- syncitem verb: item = "clone<TAB>…" or "pull<TAB>rel" -------------------
@@ -1352,7 +1387,7 @@ mod::sync() {
           org="$SEL"
           [ "$SEL_WAS_MENU" -eq 1 ] && NAV+=(org)
         fi
-        [[ "$org" =~ ^[A-Za-z0-9._-]+$ ]] || { log::err "invalid org name: $org"; return 1; }
+        org::valid "$org" || { log::err "invalid org name: $org"; return 1; }
         STEP=project ;;
       project)
         project=""
@@ -1466,12 +1501,12 @@ sync::browse() {  # $1=provider $2=org $3=project — fetch, table, select, exec
   ui::page "Sync" "multi-select repos, then batch clone (missing) / pull (cloned) — dirty repos are skipped, never touched" \
     "$provider/$org${project:+/$project} · ${#lines[@]} repos"
   export REPOKNIFE_TSV="$tmptsv" REPOKNIFE_CTX="$provider $org $project" REPOKNIFE_FORCE_COLOR=1
-  local sel
+  local sel qself; printf -v qself '%q' "$SELF"
   sel="$(printf '%s\n' "${lines[@]}" | ui::pick --multi \
         --delimiter='\t' --with-nth=2 \
         --header="type to search · space/tab select · ctrl-a all · ctrl-d none · enter run · esc back" \
         --bind 'space:toggle+down,ctrl-a:select-all,ctrl-d:deselect-all' \
-        --preview "\"$SELF\" __preview sync {1}" \
+        --preview "$qself __preview sync {1}" \
         --preview-window='right,45%,border-left,wrap' \
         | cut -f1)" || { unset REPOKNIFE_FORCE_COLOR; return 130; }   # ESC → one level up
   unset REPOKNIFE_FORCE_COLOR
@@ -1482,11 +1517,18 @@ sync::browse() {  # $1=provider $2=org $3=project — fetch, table, select, exec
 mod::sync_execute() {  # $1=provider $2=org $3=project $4=tsvfile $5=selection|__ALL__
   local provider="$1" org="$2" project="$3" tmptsv="$4" sel="$5"
   local name fork arch empty defbranch pushed url desc rel dir
+  # selection membership via one assoc map — a grep fork per TSV row stalled
+  # multi-second on 1000-repo orgs before anything rendered
+  declare -A want=()
+  local w
+  if [ "$sel" != "__ALL__" ]; then
+    while IFS= read -r w; do [ -n "$w" ] && want["$w"]=1; done <<< "$sel"
+  fi
   BATCH_ITEMS=()
   while IFS=$'\t' read -r name fork arch empty defbranch pushed url desc; do
     [ -z "$name" ] && continue
     if [ "$sel" != "__ALL__" ]; then
-      grep -qxF "$name" <<< "$sel" || continue
+      [ -n "${want[$name]:-}" ] || continue
     fi
     [ "$empty" = "1" ] && continue   # nothing to clone/pull on an empty repo
     if [ -n "$project" ]; then rel="$provider/$org/$project/$name"; else rel="$provider/$org/$name"; fi
@@ -1550,9 +1592,13 @@ init::rollback() {  # remove the .git WE just created so the folder stays a clea
 }
 
 mod::init() {
-  local cands=() c
-  while IFS= read -r c; do [ -n "$c" ] && cands+=("$c"); done \
-    < <(ui::spin "Scanning $CODE_ROOT for non-git folders…" "$SELF" __initscan)
+  local cands=() c scan
+  # spinner hoisted into a main-shell $() (gotcha #14: gum spin inside a process
+  # substitution corrupts the TTY) — and a failed scan must error loudly, not
+  # read as "tree is clean" (the proc-sub form swallowed the child's rc)
+  scan="$(ui::spin "Scanning $CODE_ROOT for non-git folders…" "$SELF" __initscan)" \
+    || { log::err "init scan failed — re-run with --plain to see why"; return 1; }
+  while IFS= read -r c; do [ -n "$c" ] && cands+=("$c"); done <<< "$scan"
   if [ "${#cands[@]}" -eq 0 ]; then log::ok "no non-git folders found — tree is clean"; return 0; fi
 
   if ! ui::is_interactive; then
@@ -1564,11 +1610,11 @@ mod::init() {
   ui::page "Init" "turn plain folders into gitflow repos: init main → commit → develop (default) · then optional GitHub remote" \
     "${#cands[@]} candidate(s)"
   export REPOKNIFE_FORCE_COLOR=1
-  local sel
+  local sel qself; printf -v qself '%q' "$SELF"
   sel="$(printf '%s\n' "${cands[@]}" | ui::pick --multi \
         --bind 'space:toggle+down,ctrl-a:select-all,ctrl-d:deselect-all' \
         --header="type to search · space/tab select · ctrl-a all · enter continue · esc back" \
-        --preview "\"$SELF\" __preview init {}" \
+        --preview "$qself __preview init {}" \
         --preview-window='right,45%,border-left,wrap')" || { unset REPOKNIFE_FORCE_COLOR; return 0; }
   unset REPOKNIFE_FORCE_COLOR
   [ -z "$sel" ] && return 0
@@ -1620,15 +1666,18 @@ mod::init() {
     done
     if ui::confirm "Create ${#remote_jobs[@]} remote repo(s) on GitHub?" "Create"; then
       auth::check_gh || return 2
-      local out
+      local out errf emsg; errf="$(tmp::dir)/createremote.err"
       for job in "${remote_jobs[@]}"; do
         IFS=$'\t' read -r rel vis <<< "$job"
         path::parse "$rel" || continue
-        if out="$(ui::spin "Creating $ORG/$REPO ($vis)…" \
-             "$SELF" __createremote "$ORG" "$REPO" "$CODE_ROOT/$rel" "$vis" 2>&1)"; then
+        if out="$(ui::spin_err "$errf" "Creating $ORG/$REPO ($vis)…" \
+             "$SELF" __createremote "$ORG" "$REPO" "$CODE_ROOT/$rel" "$vis")"; then
           results+=("$G_OK $rel · remote created · pushed · default=develop")
         else
-          results+=("$G_FAIL $rel · remote: $(tail -1 <<< "$out")")
+          # diagnosis: gh/git stderr if any, else the worker's own stdout reason
+          emsg="$(tail -1 "$errf" 2>/dev/null || true)"
+          [ -z "$emsg" ] && emsg="$(tail -1 <<< "$out")"
+          results+=("$G_FAIL $rel · remote: $emsg")
         fi
       done
     else
@@ -1643,6 +1692,18 @@ $(printf '%s\n' "${results[@]}")"
 
 # --------------------------------------------------------------------- mod::pr
 PR_JSON_FIELDS="number,title,repository,isDraft,updatedAt,author"
+
+# normalized PR-list jq → 3-col TSV (number · nameWithOwner · display row), a
+# JQ_* constant so the selftest schema-checks it like its siblings. $tw is a jq
+# variable supplied via --argjson, hence the single-quote SC2016 disable.
+# shellcheck disable=SC2016
+JQ_PR_LIST='.[] | [
+      (.number|tostring),
+      ((.repository.nameWithOwner // "") | gsub("[[:cntrl:]]"; " ")),
+      ((if .isDraft then "○ " else "● " end) + (.repository.name // "?") + " #" + (.number|tostring)
+        + "  " + (((.title // "") | gsub("[[:cntrl:]]"; " "))[:$tw])
+        + "  @" + ((.author.login // "?") | gsub("[[:cntrl:]]"; " ")))
+    ] | @tsv'
 
 pr::fetch() {  # $1 = scope: all|mine|review|assigned|mentions → JSON array on stdout
   local a b
@@ -1709,12 +1770,7 @@ mod::pr() {
 
     local lines=() titlew
     titlew=$(( $(ui::cols) >= 160 ? 90 : $(ui::cols) >= 120 ? 64 : 48 ))
-    while IFS= read -r row; do lines+=("$row"); done < <(jq -r --argjson tw "$titlew" '.[] | [
-        (.number|tostring), .repository.nameWithOwner,
-        ((if .isDraft then "○ " else "● " end) + (.repository.name) + " #" + (.number|tostring)
-          + "  " + (((.title // "") | gsub("[[:cntrl:]]"; " "))[:$tw])
-          + "  @" + ((.author.login // "?") | gsub("[[:cntrl:]]"; " ")))
-      ] | @tsv' <<< "$json")
+    while IFS= read -r row; do lines+=("$row"); done < <(jq -r --argjson tw "$titlew" "$JQ_PR_LIST" <<< "$json")
 
     if ! ui::is_interactive; then
       printf '%s\n' "${lines[@]}" | awk -F'\t' '{print $2 " #" $1 "\t" $3}'
@@ -1772,17 +1828,17 @@ mod::pr_actions() {  # $1=number $2=owner/repo
         ;;
       *diff*)   ( gh pr diff "$num" -R "$nwo" --color always | less -R ) || true ;;
       *Approve*)
-        local aerr
-        if aerr="$(ui::spin "Approving #${num}…" gh pr review "$num" -R "$nwo" --approve 2>&1)"; then
+        local aerrf; aerrf="$(tmp::dir)/gh.err"
+        if ui::spin_err "$aerrf" "Approving #${num}…" gh pr review "$num" -R "$nwo" --approve >/dev/null; then
           ui::toast ok "approved #$num"
-        else fix::offer_gh_postmortem "$aerr" "approve failed"; fi
+        else fix::offer_gh_postmortem "$(cat "$aerrf" 2>/dev/null || true)" "approve failed"; fi
         ;;
       *Merge*)
         if ui::confirm "$stratlabel #$num into $base$delmsg?" "Merge"; then
-          local merr
-          if merr="$(ui::spin "Merging #${num}…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} 2>&1)"; then
+          local merrf; merrf="$(tmp::dir)/gh.err"
+          if ui::spin_err "$merrf" "Merging #${num}…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} >/dev/null; then
             ui::toast ok "merged #$num into $base"; return 0
-          else fix::offer_gh_postmortem "$merr" "merge failed (checks pending / not mergeable?)"; fi
+          else fix::offer_gh_postmortem "$(cat "$merrf" 2>/dev/null || true)" "merge failed (checks pending / not mergeable?)"; fi
         fi
         ;;
       *browser*) gh pr view "$num" -R "$nwo" --web >/dev/null 2>&1 || true ;;
@@ -1894,7 +1950,10 @@ mod::health() {
   [ "${#repos[@]}" -eq 0 ] && { log::warn "no local repos found under $CODE_ROOT"; return 0; }
 
   local discovered=${#repos[@]} rows
-  rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${discovered} repos…" "$SELF" __fanout status)"
+  # guarded like its mod::runs sibling: as a CLI subcommand errexit is live, and
+  # an unguarded assignment would die silently INSTEAD of reaching the explicit
+  # fan-out-failure diagnostic below (which honors --exit-code for CI)
+  rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${discovered} repos…" "$SELF" __fanout status)" || rows=""
   rows="$(LC_ALL=C sort -t$'\t' -k9,9n -k1,1 <<< "$rows")"   # C locale: byte-deterministic, BSD/GNU-identical, broken-locale-safe
   # a totally empty result for a non-empty tree is a fan-out FAILURE, not "all clean"
   if [ -z "${rows//[[:space:]]/}" ]; then
@@ -2050,6 +2109,9 @@ mod::cleanup() {
   path::parse "$rel" || { log::err "not a repo path under $CODE_ROOT: $rel (expected <provider>/<org>[/<project>]/<repo>)"; return 1; }
   local dir="$CODE_ROOT/$rel"
   git::is_repo "$dir" || { log::err "$rel is not a git repo"; return 1; }
+  # with a path arg in plain mode the menu below would fail generically and
+  # exit 0 having done nothing — fail like the no-arg plain path does (rc 1)
+  ui::is_interactive || { log::err "cleanup is interactive-only"; return 1; }
 
   while :; do
     local act
@@ -2194,6 +2256,10 @@ mod::config() {
           fi
         fi
         cfg::set "$key" "$val"
+        # a code_root change must re-point the LIVE process too (bootstrap
+        # honors the env pin) — health/sync in this same session would
+        # otherwise keep using the old tree until a restart
+        [ "$key" = "code_root" ] && cfg::bootstrap
         ui::toast ok "$key = $val"
         ;;
     esac
@@ -2438,6 +2504,9 @@ menu::counts() {
 }
 
 menu::loop() {
+  # piped/CI invocation must never reach the bare gum calls below — gum is only
+  # a hard dependency when interactive, so on a gum-less box this would die 127
+  ui::is_interactive || { log::err "interactive menu unavailable in plain mode — use a subcommand (see --help)"; return 1; }
   ui::banner
   while :; do
     gum style --foreground "$C_DIM" --margin "0 0 1 2" "$(menu::counts)"
@@ -2639,6 +2708,14 @@ cli::dispatch() {
   # freeze interactivity now, on the REAL stdin/stdout — before any $() capture
   if [ "$PLAIN" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
   palette::init
+  # --provider is interpolated into provider_<p>_<verb> names and cache paths —
+  # reject anything outside the known set before it reaches either
+  if [ -n "$ARG_PROVIDER" ]; then
+    case " ${PROVIDERS[*]} " in
+      *" $ARG_PROVIDER "*) : ;;
+      *) log::die "unknown provider: $ARG_PROVIDER (github · azure-devops · gitlab)" ;;
+    esac
+  fi
   deps::check
   cfg::load
   cfg::bootstrap
@@ -2702,6 +2779,11 @@ selftest::run() {
     || t::check "parse traversal rejected" "rc1" "rc1"
   path::parse "github/acme/.." && t::check "parse dotdot repo rejected" "rc1" "rc0" \
     || t::check "parse dotdot repo rejected" "rc1" "rc1"
+
+  # --- org::valid (a leading '-' must not reach gh looking like a flag) ---
+  org::valid acme         && t::check "org valid plain" "rc0" "rc0" || t::check "org valid plain" "rc0" "rc1"
+  org::valid -foo         && t::check "org leading dash rejected" "rc1" "rc0" || t::check "org leading dash rejected" "rc1" "rc1"
+  org::valid 'a b'        && t::check "org space rejected" "rc1" "rc0" || t::check "org space rejected" "rc1" "rc1"
 
   # --- cfg: allowlist + no code execution ---
   CFG_FILE="$fix/test.conf"
@@ -2835,11 +2917,15 @@ EOF
   t::check "age relative 2h"   "2h"   "$(ui::age "$(( $(date +%s) - 7200 ))")"
   t::check "strip_ansi OSC"    "X"    "$(printf '\033]0;pwn\007X' | ui::strip_ansi)"
   t::check "strip_ansi CSI"    "red"  "$(printf '\033[31mred\033[0m' | ui::strip_ansi)"
+  # cursor-movement CSI followed by uppercase text: the old [ -\/] class spanned
+  # space..BACKSLASH and ate the text after the sequence
+  t::check "strip_ansi cursor CSI" "HELLO" "$(printf '\033[2AHELLO' | ui::strip_ansi)"
   # --version line 1 must stay exactly "repoknife X.Y.Z" (the brew formula test asserts it)
   t::check "version line shape" "yes" "$(v="$(ver::print)"; v="${v%%$'\n'*}"; [[ "$v" =~ ^repoknife[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] && echo yes || echo no)"
 
   # --- cache::file sanitization: config-supplied org/project must not escape CACHE_DIR ---
   t::check "cache key slash to _"   "$fix/c/github__a_b_c__x.tsv"   "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github 'a/b/c' 'x')"
+  t::check "cache key provider sanitized" "$fix/c/.._.._pwn__o.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file '../../pwn' o '')"
   t::check "cache key no traversal" "$fix/c/github__.._.._etc.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github '../../etc' '')"
   t::check "cache key fork suffix"  "$fix/c/github__o__nofork.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=1 cache::file github o '')"
   # live-discovery cache namespaces (fork suffix still appended under --no-forks — harmless duplication, locked here)
@@ -2855,6 +2941,18 @@ EOF
       "$(printf '%s' '[{"name":"r","isFork":false,"isArchived":false,"isEmpty":false,"defaultBranchRef":null,"pushedAt":"-","sshUrl":"u","description":"d\u0007e"}]' | jq -r "$JQ_REPO_LIST" | cut -f8)"
     t::check "runs TSV cols" "7" \
       "$(printf '%s' '[{"databaseId":1,"status":"completed","conclusion":"success","displayTitle":"t","workflowName":"w","headBranch":"b","createdAt":"2024-01-01T00:00:00Z"}]' | jq -r --arg r 'o/r' "$JQ_RUNS" | awk -F'\t' '{print NF; exit}')"
+    # empty mid-row fields must default to "-": tab is IFS whitespace, so an
+    # empty field would collapse under `IFS=$'\t' read` and shift every column
+    t::check "runs TSV empty fields default" "-|-" \
+      "$(printf '%s' '[{"databaseId":1,"status":"completed","conclusion":"success","displayTitle":"t","workflowName":"","headBranch":null,"createdAt":"2024-01-01T00:00:00Z"}]' | jq -r --arg r 'o/r' "$JQ_RUNS" | awk -F'\t' '{print $4 "|" $5; exit}')"
+    # ADO repo-list producer: 8 cols, cntrl-sanitized name, disabled filtered out
+    t::check "ado repo-list TSV cols" "8" \
+      "$(printf '%s' '[{"name":"r","isDisabled":false,"size":0,"defaultBranch":"refs/heads/main","sshUrl":"u"}]' | jq -r "$JQ_ADO_REPO_LIST" | awk -F'\t' '{print NF; exit}')"
+    t::check "ado repo-list cntrl+disabled" "1:a b" \
+      "$(printf '%s' '[{"name":"dead","isDisabled":true,"size":1,"sshUrl":"u"},{"name":"a\u0007b","size":1,"sshUrl":"u"}]' | jq -r "$JQ_ADO_REPO_LIST" | awk -F'\t' 'END{print NR":"$1}')"
+    # PR-list producer: 3 cols, cntrl stripped from the title in the display row
+    t::check "pr-list TSV cols" "3" \
+      "$(printf '%s' '[{"number":7,"title":"t\u0007x","repository":{"name":"r","nameWithOwner":"o/r"},"isDraft":false,"author":{"login":"me"}}]' | jq -r --argjson tw 90 "$JQ_PR_LIST" | awk -F'\t' '{print NF; exit}')"
     # live-discovery producers: one name per line, control chars sanitized
     t::check "ado-projects names+cntrl" "2:a b" \
       "$(printf '%s' '{"value":[{"name":"Orchestra"},{"name":"a\u0007b"}]}' | jq -r "$JQ_ADO_PROJECTS" | awk 'NR==2{s=$0} END{print NR":"s}')"
