@@ -172,7 +172,11 @@ trap 'cleanup::run; trap - INT; kill -INT $$' INT
 trap 'cleanup::run' TERM
 
 tmp::dir() {  # mktemp -d beneath RK_TMP_ROOT; cleanup::run reaps the root wholesale
-  mkdir -p "$RK_TMP_ROOT" && chmod 700 "$RK_TMP_ROOT"
+  # no -p, and never adopt a root we don't own: the $$-keyed path is predictable,
+  # so a pre-created dir/symlink in a shared /tmp must fail loudly, not be reused
+  [ -d "$RK_TMP_ROOT" ] || mkdir -m 700 "$RK_TMP_ROOT" 2>/dev/null || true
+  [ -O "$RK_TMP_ROOT" ] || log::die "temp root $RK_TMP_ROOT exists and isn't ours — remove it and retry"
+  chmod 700 "$RK_TMP_ROOT"
   mktemp -d "$RK_TMP_ROOT/XXXXXX"
 }
 
@@ -470,11 +474,6 @@ path::parse() {
   [ -n "$ORG" ] && [ -n "$REPO" ]
 }
 
-path::repo_dir() {  # $1=provider $2=org $3=project(or "") $4=repo → abs path
-  if [ -n "$3" ]; then printf '%s/%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$3" "$4"
-  else printf '%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$4"; fi
-}
-
 org::valid() {  # org/account names: alnum . _ - and NOT starting with '-'
   # (a leading '-' would reach `gh repo list "$org"` looking like a flag)
   [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]]
@@ -495,6 +494,7 @@ disco::providers() {  # providers that exist as folders
   for p in "${PROVIDERS[@]}"; do
     [ -d "$CODE_ROOT/$p" ] && printf '%s\n' "$p"
   done
+  return 0   # the loop's last test may fail — Section 07-style "never errors" contract
 }
 
 disco::orgs() {  # $1=provider → union of folder orgs + config extra_orgs_<provider>
@@ -592,9 +592,14 @@ disco::local_repos() {
     find "$CODE_ROOT/$provider" -mindepth "$arity" -maxdepth "$arity" \
          -name '.*' -prune -o -type d -print 2>/dev/null \
       | while IFS= read -r d; do
-          [ -e "$d/.git" ] && printf '%s\n' "${d#"$CODE_ROOT"/}"
+          d="${d#"$CODE_ROOT"/}"
+          # -mindepth suppresses the -prune above it, so a dotdir at org/project
+          # level (github/.backup/x) still descends — filter every component here
+          case "$d" in */.*) continue ;; esac
+          [ -e "$CODE_ROOT/$d/.git" ] && printf '%s\n' "$d"
         done
   done
+  return 0
 }
 
 # disco::init_candidates → relpaths of repo-depth dirs that are NOT git repos.
@@ -607,9 +612,12 @@ disco::init_candidates() {
     find "$CODE_ROOT/$provider" -mindepth "$arity" -maxdepth "$arity" \
          -name '.*' -prune -o -type d -print 2>/dev/null \
       | while IFS= read -r d; do
-          [ -e "$d/.git" ] || printf '%s\n' "${d#"$CODE_ROOT"/}"
+          d="${d#"$CODE_ROOT"/}"
+          case "$d" in */.*) continue ;; esac   # see disco::local_repos
+          [ -e "$CODE_ROOT/$d/.git" ] || printf '%s\n' "$d"
         done
   done
+  return 0
 }
 
 #============================================================================
@@ -741,8 +749,6 @@ provider_github_create_repo() {  # $1=org $2=repo $3=local-dir $4=private|public
                                               || { printf 'set default=develop failed\n'; return 1; }
 }
 
-provider_github_repo_url() { printf 'https://github.com/%s/%s' "$1" "$2"; }
-
 # ------------------------------------------------------------ azure devops (az)
 # normalized discovery jq filters, held in constants so the selftest can run the
 # REAL producer on canned JSON (filter/selftest drift is the classic regression).
@@ -795,8 +801,6 @@ provider_azure_devops_list_repos() {  # $1=org $2=project
 provider_azure_devops_clone_repo() {  # $1=org $2=repo $3=target-dir $4=clone-url
   git clone --progress "$4" "$3"
 }
-
-provider_azure_devops_repo_url() { printf 'https://dev.azure.com/%s/%s/_git/%s' "$1" "$3" "$2"; }
 
 provider_azure_devops_list_projects() {  # $1=org → newline project names
   local org="$1"
@@ -861,17 +865,12 @@ cache::get() {  # → TSV body on stdout; rc 1 on miss/stale; rc 0 fresh
   tail -n +2 "$f"
 }
 
-cache::age() {  # human age of the cache entry, "" if absent
-  local f; f="$(cache::file "$@")"
-  [ -f "$f" ] || return 0
-  local fetched; fetched="$(head -1 "$f" | sed -n 's/^#fetched_at=//p')"
-  [ -n "$fetched" ] && ui::age "$fetched"
-}
-
 cache::put() {  # $1=provider $2=org $3=project-or-"" ; body on stdin
   mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"
   local f; f="$(cache::file "$1" "$2" "${3:-}")"
-  { printf '#fetched_at=%s\n' "$(date +%s)"; cat; } > "$f.tmp" && mv "$f.tmp" "$f"
+  # $$-suffixed tmp: two concurrent repoknife instances on the same org must
+  # not interleave writes into one shared .tmp before the atomic mv
+  { printf '#fetched_at=%s\n' "$(date +%s)"; cat; } > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
 }
 
 cache::invalidate() { rm -f "$(cache::file "$@")"; }
@@ -926,7 +925,7 @@ worker::entry() {
   if "worker::do_$verb" "$item" > "$outdir/$idx.tmp" 2>"$outdir/$idx.err"; then
     :
   else
-    msg="$(tr '\n\t' '  ' < "$outdir/$idx.err" | cut -c1-160)"
+    msg="$(tr '\n\t' '  ' < "$outdir/$idx.err" | head -c 160)"   # bytes on BSD and GNU alike (cut -c diverges)
     # a quiet set -e trip can leave .err empty — never emit a reasonless error row
     [ -z "${msg// /}" ] && msg="worker '$verb' exited non-zero (no stderr) — re-run with --plain to see why"
     printf 'error\t%s\t%s\n' "$item" "$msg" > "$outdir/$idx.tmp"
@@ -1009,6 +1008,12 @@ worker::do_clone() {
   if [ "$DRY_RUN" -eq 1 ]; then printf 'ok\t%s\tDRY: would clone\n' "$rel"; return 0; fi
   if [ -d "$dir" ]; then printf 'skip\t%s\ttarget dir already exists\n' "$rel"; return 0; fi
   path::parse "$rel" || { printf 'error\t%s\tbad path\n' "$rel"; return 0; }
+  # scheme allowlist: the clone URL is server-provided — never let it select a
+  # git transport like ext:: (command execution) or a local path
+  case "$url" in
+    https://*|ssh://*|git@*) : ;;
+    *) printf 'error\t%s\tclone url has unexpected scheme: %s\n' "$rel" "${url:0:60}"; return 0 ;;
+  esac
   mkdir -p "$(dirname "$dir")"
   # stderr intentionally NOT discarded: it flows to the worker's .err file,
   # where batch::render picks up git's live clone progress
@@ -1714,8 +1719,10 @@ pr::fetch() {  # $1 = scope: all|mine|review|assigned|mentions → JSON array on
     mentions) gh search prs --mentions=@me         --state=open --limit 100 --sort updated --json "$PR_JSON_FIELDS" ;;
     all)
       # involves: author+assignee+mentions+commenter — review-requested is NOT included, merge it
-      a="$(gh search prs --involves=@me --state=open --limit 100 --json "$PR_JSON_FIELDS")" || a="[]"
-      b="$(gh search prs --review-requested=@me --state=open --limit 100 --json "$PR_JSON_FIELDS")" || b="[]"
+      # --sort updated like the sibling scopes: past the 100-result truncation,
+      # search-relevance order would keep arbitrary matches over recent ones
+      a="$(gh search prs --involves=@me --state=open --limit 100 --sort updated --json "$PR_JSON_FIELDS")" || a="[]"
+      b="$(gh search prs --review-requested=@me --state=open --limit 100 --sort updated --json "$PR_JSON_FIELDS")" || b="[]"
       jq -s '.[0] + .[1] | unique_by(.repository.nameWithOwner + "#" + (.number|tostring))
              | sort_by(.updatedAt) | reverse' <<< "$a
 $b" ;;
@@ -1863,7 +1870,6 @@ mod::runs() {
   [ "${#nwos[@]}" -eq 0 ] && { log::warn "no local repos for github/$org — clone some first (sync)"; return 0; }
 
   local rows
-  BATCH_ITEMS=()
   rows="$(printf '%s\n' "${nwos[@]}" | ui::spin "Fetching runs across ${#nwos[@]} repos…" \
           "$SELF" __fanout runs)" || rows=""
   [ -z "$rows" ] && { log::warn "no workflow runs found"; return 0; }
@@ -1978,10 +1984,12 @@ mod::health() {
     [ "$rank" -lt 6 ] 2>/dev/null && attention=$((attention+1))
   done <<< "$rows"
 
-  # persist counts for the instant main-menu header
+  # persist counts for the instant main-menu header (tmp+mv like cache::put —
+  # a concurrent menu::counts must never read a partially-written file)
   mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"
   printf '{"at":%s,"repos":%s,"scanned":%s,"dirty":%s,"behind":%s,"attention":%s,"errored":%s}\n' \
-    "$(date +%s)" "$discovered" "$total" "$dirty" "$behind" "$attention" "$errored" > "$CACHE_DIR/counts.json"
+    "$(date +%s)" "$discovered" "$total" "$dirty" "$behind" "$attention" "$errored" \
+    > "$CACHE_DIR/counts.json.tmp.$$" && mv "$CACHE_DIR/counts.json.tmp.$$" "$CACHE_DIR/counts.json"
 
   # display lines (column widths scale with the terminal)
   local cols repow brw
@@ -2643,6 +2651,9 @@ cli::__preview() {
         [ "$name" = "$key" ] || continue
         printf '%s%s%s\n' "$A_BOLD" "$name" "$A_RST"
         printf '%s%s%s\n\n' "$A_FAINT" "──────────────────────────────────────" "$A_RST"
+        # undo jq @tsv backslash-escaping for display (\t/\n can't appear:
+        # control chars were gsub'd to spaces at ingestion — only \\ remains)
+        desc="${desc//$'\\\\'/$'\\'}"
         [ -n "$desc" ] && printf '%s\n\n' "$desc"
         printf '  %sdefault%s  %s\n' "$A_DIM" "$A_RST" "$defbranch"
         printf '  %spushed%s   %s ago\n' "$A_DIM" "$A_RST" "$(ui::age "$pushed")"
@@ -2751,6 +2762,7 @@ selftest::run() {
   mkdir -p "$fix/github/acme/widget/.git" \
            "$fix/github/acme/plainfolder" \
            "$fix/github/acme/.hidden/repo" \
+           "$fix/github/.archive/legacy/.git" \
            "$fix/azure-devops/corp/Proj/api/.git" \
            "$fix/azure-devops/corp/Proj/scratch" \
            "$fix/gitlab/grp/No Project/tool/.git"
