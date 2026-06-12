@@ -503,7 +503,10 @@ disco::ado_projects() {  # $1=org → folder projects + config ado_project_map e
     fi
     map="$(cfg::get ado_project_map)"
     if [ -n "$map" ]; then
-      tr ',' '\n' <<< "$map" | while IFS= read -r pair; do
+      # trim each pair like disco::orgs trims extras — the template's documented
+      # format is spaced ("corp:Platform, corp:Mobile"); an untrimmed " corp"
+      # silently fails the org match and the entry vanishes from the picker
+      tr ',' '\n' <<< "$map" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | while IFS= read -r pair; do
         [ "${pair%%:*}" = "$org" ] && printf '%s\n' "${pair#*:}"
       done
     fi
@@ -1031,13 +1034,41 @@ worker::do_syncitem() {
 # plain output. Results merged into BATCH_RESULTS[] ("status<TAB>rel<TAB>msg").
 BATCH_ITEMS=()
 BATCH_RESULTS=()
+# renderer caches (reset per batch::run): one label per item, state/msg ingested
+# once per finished item, completion order for the height-limited window
+BATCH_LABELS=(); BATCH_STATE=(); BATCH_MSG=(); BATCH_DONE_ORDER=()
+BATCH_OKC=0; BATCH_SKIPC=0; BATCH_FAILC=0
 
-batch::label() { local f="${1%%	*}"; [ "$f" = clone ] || [ "$f" = pull ] && { local r="${1#*	}"; f="${r%%	*}"; }; basename "$f"; }
+batch::label() {  # $1=item [$2=maxw] — pure bash, no forks; verbs strip to the relpath basename
+  local f="${1%%	*}" w="${2:-0}"
+  if [ "$f" = clone ] || [ "$f" = pull ]; then f="${1#*	}"; f="${f%%	*}"; fi
+  f="${f##*/}"
+  if [ "$w" -gt 0 ] && [ "${#f}" -gt "$w" ]; then f="${f:0:$((w-1))}…"; fi
+  printf '%s' "$f"
+}
+
+batch::winmath() {  # $1=maxlines $2=inflight $3=done → "show_inflight show_done"
+  # one line of the budget is reserved for the summary footer
+  local max="$1" inf="$2" dn="$3" cap wi wd
+  cap=$(( max - 1 )); [ "$cap" -lt 1 ] && cap=1
+  wi="$inf"; [ "$wi" -gt "$cap" ] && wi="$cap"
+  wd=$(( cap - wi )); [ "$wd" -gt "$dn" ] && wd="$dn"
+  printf '%s %s' "$wi" "$wd"
+}
 
 batch::run() {  # $1 = worker verb
   local verb="$1" outdir n=${#BATCH_ITEMS[@]}
   BATCH_RESULTS=()
   [ "$n" -eq 0 ] && return 0
+  # renderer state: labels precomputed ONCE (the renderer used to fork
+  # label/trunc/printf subshells per item per 250ms frame — O(N) forks/frame);
+  # finished items are ingested once into state/msg caches, never re-read.
+  BATCH_LABELS=(); BATCH_STATE=(); BATCH_MSG=(); BATCH_DONE_ORDER=()
+  BATCH_OKC=0; BATCH_SKIPC=0; BATCH_FAILC=0; BATCH_LASTN=0
+  local it
+  for it in "${BATCH_ITEMS[@]}"; do
+    BATCH_LABELS+=("$(batch::label "$it" 24)")
+  done
   outdir="$(tmp::dir)"
   export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # DRY_RUN/EXCLUDE_FORKS exported once at top
   printf '%s\n' "${BATCH_ITEMS[@]}" | worker::write_items "$outdir" >/dev/null
@@ -1076,20 +1107,61 @@ batch::run() {  # $1 = worker verb
 }
 
 SPIN_I=0
+BATCH_LASTN=0
 batch::render() {  # $1=outdir $2=first(1|0)
-  local outdir="$1" first="$2" idx item label line state msg prog progw
-  progw=$(( $(ui::cols) - 34 )); [ "$progw" -lt 24 ] && progw=24; [ "$progw" -gt 90 ] && progw=90
+  local outdir="$1" first="$2" idx line state msg prog progw lbl
+  local cols rows maxlines
+  cols=$(ui::cols); rows=$(tput lines 2>/dev/null || echo 24)
+  progw=$(( cols - 34 )); [ "$progw" -lt 24 ] && progw=24; [ "$progw" -gt 90 ] && progw=90
+  maxlines=$(( rows - 4 )); [ "$maxlines" -lt 5 ] && maxlines=5
   SPIN_I=$(( (SPIN_I + 1) % ${#SPIN_FRAMES[@]} ))
-  [ "$first" -eq 0 ] && printf '\033[%dA' "${#BATCH_ITEMS[@]}"
+
+  # ingest newly finished items ONCE (cache state+msg, record completion order)
+  local n=${#BATCH_ITEMS[@]} inflight=()
   for idx in "${!BATCH_ITEMS[@]}"; do
-    item="${BATCH_ITEMS[$idx]}"
-    label="$(batch::label "$item")"
+    [ -n "${BATCH_STATE[$idx]:-}" ] && continue
     if [ -f "$outdir/$idx.out" ]; then
       IFS=$'\t' read -r state _ msg < "$outdir/$idx.out"
+      BATCH_STATE[idx]="$state"; BATCH_MSG[idx]="$msg"
+      BATCH_DONE_ORDER+=("$idx")
       case "$state" in
-        ok)    line="${A_GREEN}${G_OK}${A_RST} $(printf '%-24s' "$label") ${A_DIM}${msg}${A_RST}" ;;
-        skip)  line="${A_YELLOW}${G_WARN}${A_RST} $(printf '%-24s' "$label") ${A_YELLOW}skipped${A_RST} ${A_DIM}· ${msg}${A_RST}" ;;
-        *)     line="${A_REDX}${G_FAIL}${A_RST} $(printf '%-24s' "$label") ${A_REDX}${msg}${A_RST}" ;;
+        ok)   BATCH_OKC=$((BATCH_OKC+1)) ;;
+        skip) BATCH_SKIPC=$((BATCH_SKIPC+1)) ;;
+        *)    BATCH_FAILC=$((BATCH_FAILC+1)) ;;
+      esac
+    elif [ -f "$outdir/$idx.start" ]; then
+      inflight+=("$idx")
+    fi
+  done
+
+  # pick the lines for this frame: everything when it fits, else a window of
+  # live items + the most recent completions, with one summary footer line
+  # (cursor-up by the FULL item count on an over-tall batch scroll-spammed the
+  # terminal at 4 fps — CUU clamps at the top row, every frame re-scrolled)
+  local dn=${#BATCH_DONE_ORDER[@]}
+  local queued=$(( n - dn - ${#inflight[@]} ))
+  local show=() footer=""
+  if [ "$n" -le "$maxlines" ]; then
+    show=("${!BATCH_ITEMS[@]}")
+  else
+    local wi wd
+    read -r wi wd <<< "$(batch::winmath "$maxlines" "${#inflight[@]}" "$dn")"
+    [ "$wi" -gt 0 ] && show+=("${inflight[@]:0:$wi}")
+    [ "$wd" -gt 0 ] && show+=("${BATCH_DONE_ORDER[@]: -$wd}")
+    footer="  ${A_DIM}… ${dn} done (${BATCH_OKC} ok · ${BATCH_SKIPC} skipped · ${BATCH_FAILC} failed) · ${#inflight[@]} running · ${queued} queued — of ${n}${A_RST}"
+  fi
+
+  [ "$first" -eq 0 ] && [ "$BATCH_LASTN" -gt 0 ] && printf '\033[%dA' "$BATCH_LASTN"
+  local printed=0
+  for idx in ${show[@]+"${show[@]}"}; do
+    printf -v lbl '%-24s' "${BATCH_LABELS[$idx]}"
+    state="${BATCH_STATE[$idx]:-}"
+    if [ -n "$state" ]; then
+      msg="${BATCH_MSG[$idx]}"
+      case "$state" in
+        ok)    line="${A_GREEN}${G_OK}${A_RST} ${lbl} ${A_DIM}${msg}${A_RST}" ;;
+        skip)  line="${A_YELLOW}${G_WARN}${A_RST} ${lbl} ${A_YELLOW}skipped${A_RST} ${A_DIM}· ${msg}${A_RST}" ;;
+        *)     line="${A_REDX}${G_FAIL}${A_RST} ${lbl} ${A_REDX}${msg}${A_RST}" ;;
       esac
     elif [ -f "$outdir/$idx.start" ]; then
       # live progress: git clone --progress streams to the worker's .err —
@@ -1100,14 +1172,18 @@ batch::render() {  # $1=outdir $2=first(1|0)
                 | grep -v '^[[:space:]]*$' | tail -1 | LC_ALL=C tr -d '\000-\037' || true)"
       fi
       if [ -z "$prog" ]; then
-        case "$item" in clone*) prog="cloning…" ;; pull*) prog="pulling…" ;; *) prog="working…" ;; esac
+        case "${BATCH_ITEMS[$idx]}" in clone*) prog="cloning…" ;; pull*) prog="pulling…" ;; *) prog="working…" ;; esac
       fi
-      line="${A_CYAN}${SPIN_FRAMES[$SPIN_I]}${A_RST} $(printf '%-24s' "$label") ${A_DIM}$(ui::trunc "$prog" "$progw")${A_RST}"
+      line="${A_CYAN}${SPIN_FRAMES[$SPIN_I]}${A_RST} ${lbl} ${A_DIM}$(ui::trunc "$prog" "$progw")${A_RST}"
     else
-      line="${A_FAINT}${G_PEND}${A_RST} $(printf '%-24s' "$label") ${A_FAINT}queued${A_RST}"
+      line="${A_FAINT}${G_PEND}${A_RST} ${lbl} ${A_FAINT}queued${A_RST}"
     fi
     printf '\033[2K  %s\n' "$line"
+    printed=$((printed+1))
   done
+  if [ -n "$footer" ]; then printf '\033[2K%s\n' "$footer"; printed=$((printed+1)); fi
+  printf '\033[J'   # erase leftovers when this frame printed fewer lines than the last
+  BATCH_LASTN="$printed"
 }
 
 batch::summary() {  # $1 = title ; prints semantic-colored box from BATCH_RESULTS
@@ -1499,7 +1575,10 @@ mod::init() {
 
   local rel dir vis choice remote_jobs=() results=()
   local default_vis; default_vis="$(cfg::get default_visibility private)"
-  while IFS= read -r rel; do
+  # read the selection on fd 3, NOT fd 0: the per-folder gum menu below inherits
+  # stdin, and gum drains a non-TTY fd 0 even with args — with `done <<< "$sel"`
+  # only the FIRST selected folder would survive the loop (rest eaten by gum)
+  while IFS= read -r rel <&3; do
     [ -z "$rel" ] && continue
     dir="$CODE_ROOT/$rel"
     path::parse "$rel" || { log::err "$rel: cannot parse path"; continue; }
@@ -1527,7 +1606,7 @@ mod::init() {
     else
       results+=("$G_OK $rel · local only (remote creation not supported for $PROVIDER in v1)")
     fi
-  done <<< "$sel"
+  done 3<<< "$sel"
 
   # --- batch confirm + create remotes ---
   if [ "${#remote_jobs[@]}" -gt 0 ]; then
@@ -2696,6 +2775,10 @@ EOF
   t::check "disco providers" "azure-devops github gitlab" "$(disco::providers | sort | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco orgs union+dedup" "acme other-org" "$(disco::orgs github | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco ado projects" "Proj" "$(disco::ado_projects corp | tr '\n' ' ' | sed 's/ $//')"
+  # the template documents the SPACED map format — entries after a ", " must not vanish
+  CFG[ado_project_map]='corp:Proj, corp:Other, other-org:X'
+  t::check "disco ado projects (spaced map)" "Other Proj" "$(disco::ado_projects corp | tr '\n' ' ' | sed 's/ $//')"
+  CFG[ado_project_map]='corp:Proj'
   t::check "disco local repos" "azure-devops/corp/Proj/api github/acme/widget gitlab/grp/No Project/tool" \
     "$(disco::local_repos | sort | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco init candidates (depth-exact, no dotdirs)" \
@@ -2782,6 +2865,15 @@ EOF
   # --- worker dry/dispatch branches (pure) ---
   t::check "clone dry-run"           $'ok\tgithub/acme/new\tDRY: would clone' "$(DRY_RUN=1 worker::do_clone $'github/acme/new\turl\tmain')"
   t::check "syncitem unknown action" "error" "$(worker::do_syncitem $'bogus\tx' | cut -f1)"
+
+  # --- batch renderer pure helpers (label extraction/truncation + window math) ---
+  t::check "batch label clone item" "widget"  "$(batch::label $'clone\tgithub/acme/widget\turl\tmain')"
+  t::check "batch label pull item"  "tool"    "$(batch::label $'pull\tgitlab/grp/No Project/tool')"
+  t::check "batch label truncates"  "abcdefg…" "$(batch::label $'pull\tgithub/o/abcdefghij' 8)"
+  t::check "winmath all fit"        "3 6"     "$(batch::winmath 10 3 6)"
+  t::check "winmath inflight capped" "9 0"    "$(batch::winmath 10 20 50)"
+  t::check "winmath done fills rest" "2 7"    "$(batch::winmath 10 2 50)"
+  t::check "winmath tiny terminal"  "1 0"     "$(batch::winmath 1 5 5)"
 
   # --- worker fanout round-trip (xargs + item files preserve tabs) ---
   local fan
