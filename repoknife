@@ -172,7 +172,11 @@ trap 'cleanup::run; trap - INT; kill -INT $$' INT
 trap 'cleanup::run' TERM
 
 tmp::dir() {  # mktemp -d beneath RK_TMP_ROOT; cleanup::run reaps the root wholesale
-  mkdir -p "$RK_TMP_ROOT" && chmod 700 "$RK_TMP_ROOT"
+  # no -p, and never adopt a root we don't own: the $$-keyed path is predictable,
+  # so a pre-created dir/symlink in a shared /tmp must fail loudly, not be reused
+  [ -d "$RK_TMP_ROOT" ] || mkdir -m 700 "$RK_TMP_ROOT" 2>/dev/null || true
+  [ -O "$RK_TMP_ROOT" ] || log::die "temp root $RK_TMP_ROOT exists and isn't ours — remove it and retry"
+  chmod 700 "$RK_TMP_ROOT"
   mktemp -d "$RK_TMP_ROOT/XXXXXX"
 }
 
@@ -203,8 +207,12 @@ ui::cols() { tput cols 2>/dev/null || echo 80; }
 
 # Full ANSI/control strip for plain-mode output: OSC (title/clipboard), all CSI
 # (not just SGR colors), then residual control bytes. BSD-sed safe via $'' ESC.
+# The CSI command uses a ',' delimiter so the intermediate-byte class can be the
+# literal range [ -/] (0x20-0x2F): with the '/' delimiter it had to be escaped
+# as [ -\/], which brackets parse as space-through-BACKSLASH — that wrongly
+# spans digits/uppercase and ate printable text after cursor-movement CSIs.
 ui::strip_ansi() {
-  LC_ALL=C sed -E $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)?//g; s/\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' \
+  LC_ALL=C sed -E $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)?//g; s,\x1b\\[[0-9;?]*[ -/]*[@-~],,g' \
     | LC_ALL=C tr -d '\000-\010\013\014\016-\037'
 }
 
@@ -262,6 +270,22 @@ ui::spin() {  # $1=title, rest = command; captures stdout; rc = command rc
   else
     printf '%s\n' "$title" >&2
     "$@"
+  fi
+}
+
+ui::spin_err() {  # $1=errfile $2=title, rest = command — the COMMAND's stderr
+  # goes to the file. NEVER capture ui::spin with 2>&1 instead: gum renders the
+  # spinner on ITS stderr, so 2>&1 makes the spinner invisible and mixes its
+  # ANSI frames into the captured error text.
+  local errf="$1" title="$2"; shift 2
+  if ui::is_interactive; then
+    # shellcheck disable=SC2016  # $1/$@ deliberately expand in the INNER bash
+    gum spin --spinner dot --spinner.foreground "$C_CYAN" \
+      --title "$title" --show-output -- \
+      bash -c 'exec 2>"$1"; shift; exec "$@"' _ "$errf" "$@"
+  else
+    printf '%s\n' "$title" >&2
+    "$@" 2>"$errf"
   fi
 }
 
@@ -450,9 +474,9 @@ path::parse() {
   [ -n "$ORG" ] && [ -n "$REPO" ]
 }
 
-path::repo_dir() {  # $1=provider $2=org $3=project(or "") $4=repo → abs path
-  if [ -n "$3" ]; then printf '%s/%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$3" "$4"
-  else printf '%s/%s/%s/%s' "$CODE_ROOT" "$1" "$2" "$4"; fi
+org::valid() {  # org/account names: alnum . _ - and NOT starting with '-'
+  # (a leading '-' would reach `gh repo list "$org"` looking like a flag)
+  [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]]
 }
 
 path::expand_tilde() {  # $1=value; expand a leading ~ / ~/ to $HOME (no eval, no glob)
@@ -470,6 +494,7 @@ disco::providers() {  # providers that exist as folders
   for p in "${PROVIDERS[@]}"; do
     [ -d "$CODE_ROOT/$p" ] && printf '%s\n' "$p"
   done
+  return 0   # the loop's last test may fail — Section 07-style "never errors" contract
 }
 
 disco::orgs() {  # $1=provider → union of folder orgs + config extra_orgs_<provider>
@@ -503,7 +528,10 @@ disco::ado_projects() {  # $1=org → folder projects + config ado_project_map e
     fi
     map="$(cfg::get ado_project_map)"
     if [ -n "$map" ]; then
-      tr ',' '\n' <<< "$map" | while IFS= read -r pair; do
+      # trim each pair like disco::orgs trims extras — the template's documented
+      # format is spaced ("corp:Platform, corp:Mobile"); an untrimmed " corp"
+      # silently fails the org match and the entry vanishes from the picker
+      tr ',' '\n' <<< "$map" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | while IFS= read -r pair; do
         [ "${pair%%:*}" = "$org" ] && printf '%s\n' "${pair#*:}"
       done
     fi
@@ -564,9 +592,14 @@ disco::local_repos() {
     find "$CODE_ROOT/$provider" -mindepth "$arity" -maxdepth "$arity" \
          -name '.*' -prune -o -type d -print 2>/dev/null \
       | while IFS= read -r d; do
-          [ -e "$d/.git" ] && printf '%s\n' "${d#"$CODE_ROOT"/}"
+          d="${d#"$CODE_ROOT"/}"
+          # -mindepth suppresses the -prune above it, so a dotdir at org/project
+          # level (github/.backup/x) still descends — filter every component here
+          case "$d" in */.*) continue ;; esac
+          [ -e "$CODE_ROOT/$d/.git" ] && printf '%s\n' "$d"
         done
   done
+  return 0
 }
 
 # disco::init_candidates → relpaths of repo-depth dirs that are NOT git repos.
@@ -579,9 +612,12 @@ disco::init_candidates() {
     find "$CODE_ROOT/$provider" -mindepth "$arity" -maxdepth "$arity" \
          -name '.*' -prune -o -type d -print 2>/dev/null \
       | while IFS= read -r d; do
-          [ -e "$d/.git" ] || printf '%s\n' "${d#"$CODE_ROOT"/}"
+          d="${d#"$CODE_ROOT"/}"
+          case "$d" in */.*) continue ;; esac   # see disco::local_repos
+          [ -e "$CODE_ROOT/$d/.git" ] || printf '%s\n' "$d"
         done
   done
+  return 0
 }
 
 #============================================================================
@@ -675,7 +711,7 @@ JQ_REPO_LIST='.[] | [
       (if .isEmpty then "1" else "0" end),
       (.defaultBranchRef.name // "-"),
       (.pushedAt // "-"),
-      .sshUrl,
+      (.sshUrl // "-"),
       ((.description // "") | gsub("[[:cntrl:]]"; " "))
     ] | @tsv'
 # ---------------------------------------------------------------- github (gh)
@@ -713,8 +749,6 @@ provider_github_create_repo() {  # $1=org $2=repo $3=local-dir $4=private|public
                                               || { printf 'set default=develop failed\n'; return 1; }
 }
 
-provider_github_repo_url() { printf 'https://github.com/%s/%s' "$1" "$2"; }
-
 # ------------------------------------------------------------ azure devops (az)
 # normalized discovery jq filters, held in constants so the selftest can run the
 # REAL producer on canned JSON (filter/selftest drift is the classic regression).
@@ -741,6 +775,18 @@ ado::ensure_auth() {  # interactive pre-check — call BEFORE any spinner/captur
              "az login" "ado::auth_ok" 2
 }
 
+# ADO repo-list jq → same 8-col TSV as JQ_REPO_LIST (constant so the selftest
+# schema-checks it; .name sanitized like every other remote-string ingestion)
+JQ_ADO_REPO_LIST='.[] | select(.isDisabled != true) | [
+      ((.name // "") | gsub("[[:cntrl:]]"; " ")),
+      "0", "0",
+      (if (.size // 0) == 0 then "1" else "0" end),
+      ((.defaultBranch // "-") | sub("^refs/heads/"; "")),
+      "-",
+      (.sshUrl // "-"),
+      ""
+    ] | @tsv'
+
 provider_azure_devops_list_repos() {  # $1=org $2=project
   local org="$1" project="$2"
   if ! ado::auth_ok; then
@@ -749,29 +795,21 @@ provider_azure_devops_list_repos() {  # $1=org $2=project
   fi
   az repos list --organization "$(ado::org_url "$org")" --project "$project" \
      --only-show-errors -o json \
-  | jq -r '.[] | select(.isDisabled != true) | [
-      .name, "0", "0",
-      (if (.size // 0) == 0 then "1" else "0" end),
-      ((.defaultBranch // "-") | sub("^refs/heads/"; "")),
-      "-",
-      .sshUrl,
-      ""
-    ] | @tsv'
+  | jq -r "$JQ_ADO_REPO_LIST"
 }
 
 provider_azure_devops_clone_repo() {  # $1=org $2=repo $3=target-dir $4=clone-url
   git clone --progress "$4" "$3"
 }
 
-provider_azure_devops_repo_url() { printf 'https://dev.azure.com/%s/%s/_git/%s' "$1" "$3" "$2"; }
-
 provider_azure_devops_list_projects() {  # $1=org → newline project names
   local org="$1"
   ado::auth_ok || { log::err "Azure DevOps not authenticated. Run: az login"; return 2; }
   # AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no: a missing azure-devops extension errors
   # cleanly (→ empty → caller falls back) instead of prompting inside the worker.
+  # --top: the API serves ONE page by default — large orgs truncate silently
   AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no \
-    az devops project list --organization "$(ado::org_url "$org")" --only-show-errors -o json \
+    az devops project list --organization "$(ado::org_url "$org")" --top 500 --only-show-errors -o json \
   | jq -r "$JQ_ADO_PROJECTS"
 }
 
@@ -807,11 +845,12 @@ provider_gitlab_create_repo() { gitlab::stub; }
 #  TTL'd remote repo-list TSV per provider+org(+project) under ~/.cache/repoknife.
 #  First line: "#fetched_at=<epoch>" — body is the normalized TSV.
 #============================================================================
-cache::file() {  # $1=provider $2=org [$3=project] — fork-filter is part of the key
-  # sanitize path components: org/project come from config too ('/', '..' must not escape CACHE_DIR)
-  local org="${2//[^A-Za-z0-9._-]/_}" project="${3:-}"
+cache::file() {  # $1=provider/namespace $2=org [$3=project] — fork-filter is part of the key
+  # sanitize ALL path components: org/project come from config, and the provider
+  # reaches here from --provider — none may escape CACHE_DIR ('/', '..')
+  local prov="${1//[^A-Za-z0-9._-]/_}" org="${2//[^A-Za-z0-9._-]/_}" project="${3:-}"
   project="${project//[^A-Za-z0-9._-]/_}"
-  printf '%s/%s__%s%s%s.tsv' "$CACHE_DIR" "$1" "$org" "${project:+__$project}" \
+  printf '%s/%s__%s%s%s.tsv' "$CACHE_DIR" "$prov" "$org" "${project:+__$project}" \
     "$( [ "$EXCLUDE_FORKS" -eq 1 ] && printf '__nofork' )"
 }
 
@@ -826,17 +865,12 @@ cache::get() {  # → TSV body on stdout; rc 1 on miss/stale; rc 0 fresh
   tail -n +2 "$f"
 }
 
-cache::age() {  # human age of the cache entry, "" if absent
-  local f; f="$(cache::file "$@")"
-  [ -f "$f" ] || return 0
-  local fetched; fetched="$(head -1 "$f" | sed -n 's/^#fetched_at=//p')"
-  [ -n "$fetched" ] && ui::age "$fetched"
-}
-
 cache::put() {  # $1=provider $2=org $3=project-or-"" ; body on stdin
   mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"
   local f; f="$(cache::file "$1" "$2" "${3:-}")"
-  { printf '#fetched_at=%s\n' "$(date +%s)"; cat; } > "$f.tmp" && mv "$f.tmp" "$f"
+  # $$-suffixed tmp: two concurrent repoknife instances on the same org must
+  # not interleave writes into one shared .tmp before the atomic mv
+  { printf '#fetched_at=%s\n' "$(date +%s)"; cat; } > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
 }
 
 cache::invalidate() { rm -f "$(cache::file "$@")"; }
@@ -891,7 +925,7 @@ worker::entry() {
   if "worker::do_$verb" "$item" > "$outdir/$idx.tmp" 2>"$outdir/$idx.err"; then
     :
   else
-    msg="$(tr '\n\t' '  ' < "$outdir/$idx.err" | cut -c1-160)"
+    msg="$(tr '\n\t' '  ' < "$outdir/$idx.err" | head -c 160)"   # bytes on BSD and GNU alike (cut -c diverges)
     # a quiet set -e trip can leave .err empty — never emit a reasonless error row
     [ -z "${msg// /}" ] && msg="worker '$verb' exited non-zero (no stderr) — re-run with --plain to see why"
     printf 'error\t%s\t%s\n' "$item" "$msg" > "$outdir/$idx.tmp"
@@ -974,6 +1008,12 @@ worker::do_clone() {
   if [ "$DRY_RUN" -eq 1 ]; then printf 'ok\t%s\tDRY: would clone\n' "$rel"; return 0; fi
   if [ -d "$dir" ]; then printf 'skip\t%s\ttarget dir already exists\n' "$rel"; return 0; fi
   path::parse "$rel" || { printf 'error\t%s\tbad path\n' "$rel"; return 0; }
+  # scheme allowlist: the clone URL is server-provided — never let it select a
+  # git transport like ext:: (command execution) or a local path
+  case "$url" in
+    https://*|ssh://*|git@*) : ;;
+    *) printf 'error\t%s\tclone url has unexpected scheme: %s\n' "$rel" "${url:0:60}"; return 0 ;;
+  esac
   mkdir -p "$(dirname "$dir")"
   # stderr intentionally NOT discarded: it flows to the worker's .err file,
   # where batch::render picks up git's live clone progress
@@ -999,16 +1039,19 @@ JQ_RUNS='.[] | [
        elif .conclusion == "success" then "pass"
        elif .conclusion == "skipped" then "skipped"
        else "fail" end),
-      ((.workflowName // "") | gsub("[[:cntrl:]]"; " ")),
-      ((.headBranch // "") | gsub("[[:cntrl:]]"; " ")),
+      ((.workflowName // "") | gsub("[[:cntrl:]]"; " ") | if . == "" then "-" else . end),
+      ((.headBranch // "") | gsub("[[:cntrl:]]"; " ") | if . == "" then "-" else . end),
       .createdAt,
       ((.displayTitle // "") | gsub("[[:cntrl:]]"; " "))
     ] | @tsv'
 worker::do_runs() {
   local nwo="$1"
+  # gh failures must propagate (no 2>/dev/null, no || true): worker::entry then
+  # synthesizes the error row from gh's real stderr — that row is what makes the
+  # auth/rate-limit hint in mod::runs reachable at all
   gh run list -R "$nwo" --limit 5 \
-     --json databaseId,status,conclusion,displayTitle,workflowName,headBranch,createdAt 2>/dev/null \
-  | jq -r --arg r "$nwo" "$JQ_RUNS" || true
+     --json databaseId,status,conclusion,displayTitle,workflowName,headBranch,createdAt \
+  | jq -r --arg r "$nwo" "$JQ_RUNS"
 }
 
 # --- syncitem verb: item = "clone<TAB>…" or "pull<TAB>rel" -------------------
@@ -1031,13 +1074,41 @@ worker::do_syncitem() {
 # plain output. Results merged into BATCH_RESULTS[] ("status<TAB>rel<TAB>msg").
 BATCH_ITEMS=()
 BATCH_RESULTS=()
+# renderer caches (reset per batch::run): one label per item, state/msg ingested
+# once per finished item, completion order for the height-limited window
+BATCH_LABELS=(); BATCH_STATE=(); BATCH_MSG=(); BATCH_DONE_ORDER=()
+BATCH_OKC=0; BATCH_SKIPC=0; BATCH_FAILC=0
 
-batch::label() { local f="${1%%	*}"; [ "$f" = clone ] || [ "$f" = pull ] && { local r="${1#*	}"; f="${r%%	*}"; }; basename "$f"; }
+batch::label() {  # $1=item [$2=maxw] — pure bash, no forks; verbs strip to the relpath basename
+  local f="${1%%	*}" w="${2:-0}"
+  if [ "$f" = clone ] || [ "$f" = pull ]; then f="${1#*	}"; f="${f%%	*}"; fi
+  f="${f##*/}"
+  if [ "$w" -gt 0 ] && [ "${#f}" -gt "$w" ]; then f="${f:0:$((w-1))}…"; fi
+  printf '%s' "$f"
+}
+
+batch::winmath() {  # $1=maxlines $2=inflight $3=done → "show_inflight show_done"
+  # one line of the budget is reserved for the summary footer
+  local max="$1" inf="$2" dn="$3" cap wi wd
+  cap=$(( max - 1 )); [ "$cap" -lt 1 ] && cap=1
+  wi="$inf"; [ "$wi" -gt "$cap" ] && wi="$cap"
+  wd=$(( cap - wi )); [ "$wd" -gt "$dn" ] && wd="$dn"
+  printf '%s %s' "$wi" "$wd"
+}
 
 batch::run() {  # $1 = worker verb
   local verb="$1" outdir n=${#BATCH_ITEMS[@]}
   BATCH_RESULTS=()
   [ "$n" -eq 0 ] && return 0
+  # renderer state: labels precomputed ONCE (the renderer used to fork
+  # label/trunc/printf subshells per item per 250ms frame — O(N) forks/frame);
+  # finished items are ingested once into state/msg caches, never re-read.
+  BATCH_LABELS=(); BATCH_STATE=(); BATCH_MSG=(); BATCH_DONE_ORDER=()
+  BATCH_OKC=0; BATCH_SKIPC=0; BATCH_FAILC=0; BATCH_LASTN=0
+  local it
+  for it in "${BATCH_ITEMS[@]}"; do
+    BATCH_LABELS+=("$(batch::label "$it" 24)")
+  done
   outdir="$(tmp::dir)"
   export REPOKNIFE_CODE_ROOT="$CODE_ROOT"   # DRY_RUN/EXCLUDE_FORKS exported once at top
   printf '%s\n' "${BATCH_ITEMS[@]}" | worker::write_items "$outdir" >/dev/null
@@ -1076,20 +1147,61 @@ batch::run() {  # $1 = worker verb
 }
 
 SPIN_I=0
+BATCH_LASTN=0
 batch::render() {  # $1=outdir $2=first(1|0)
-  local outdir="$1" first="$2" idx item label line state msg prog progw
-  progw=$(( $(ui::cols) - 34 )); [ "$progw" -lt 24 ] && progw=24; [ "$progw" -gt 90 ] && progw=90
+  local outdir="$1" first="$2" idx line state msg prog progw lbl
+  local cols rows maxlines
+  cols=$(ui::cols); rows=$(tput lines 2>/dev/null || echo 24)
+  progw=$(( cols - 34 )); [ "$progw" -lt 24 ] && progw=24; [ "$progw" -gt 90 ] && progw=90
+  maxlines=$(( rows - 4 )); [ "$maxlines" -lt 5 ] && maxlines=5
   SPIN_I=$(( (SPIN_I + 1) % ${#SPIN_FRAMES[@]} ))
-  [ "$first" -eq 0 ] && printf '\033[%dA' "${#BATCH_ITEMS[@]}"
+
+  # ingest newly finished items ONCE (cache state+msg, record completion order)
+  local n=${#BATCH_ITEMS[@]} inflight=()
   for idx in "${!BATCH_ITEMS[@]}"; do
-    item="${BATCH_ITEMS[$idx]}"
-    label="$(batch::label "$item")"
+    [ -n "${BATCH_STATE[$idx]:-}" ] && continue
     if [ -f "$outdir/$idx.out" ]; then
       IFS=$'\t' read -r state _ msg < "$outdir/$idx.out"
+      BATCH_STATE[idx]="$state"; BATCH_MSG[idx]="$msg"
+      BATCH_DONE_ORDER+=("$idx")
       case "$state" in
-        ok)    line="${A_GREEN}${G_OK}${A_RST} $(printf '%-24s' "$label") ${A_DIM}${msg}${A_RST}" ;;
-        skip)  line="${A_YELLOW}${G_WARN}${A_RST} $(printf '%-24s' "$label") ${A_YELLOW}skipped${A_RST} ${A_DIM}· ${msg}${A_RST}" ;;
-        *)     line="${A_REDX}${G_FAIL}${A_RST} $(printf '%-24s' "$label") ${A_REDX}${msg}${A_RST}" ;;
+        ok)   BATCH_OKC=$((BATCH_OKC+1)) ;;
+        skip) BATCH_SKIPC=$((BATCH_SKIPC+1)) ;;
+        *)    BATCH_FAILC=$((BATCH_FAILC+1)) ;;
+      esac
+    elif [ -f "$outdir/$idx.start" ]; then
+      inflight+=("$idx")
+    fi
+  done
+
+  # pick the lines for this frame: everything when it fits, else a window of
+  # live items + the most recent completions, with one summary footer line
+  # (cursor-up by the FULL item count on an over-tall batch scroll-spammed the
+  # terminal at 4 fps — CUU clamps at the top row, every frame re-scrolled)
+  local dn=${#BATCH_DONE_ORDER[@]}
+  local queued=$(( n - dn - ${#inflight[@]} ))
+  local show=() footer=""
+  if [ "$n" -le "$maxlines" ]; then
+    show=("${!BATCH_ITEMS[@]}")
+  else
+    local wi wd
+    read -r wi wd <<< "$(batch::winmath "$maxlines" "${#inflight[@]}" "$dn")"
+    [ "$wi" -gt 0 ] && show+=("${inflight[@]:0:$wi}")
+    [ "$wd" -gt 0 ] && show+=("${BATCH_DONE_ORDER[@]: -$wd}")
+    footer="  ${A_DIM}… ${dn} done (${BATCH_OKC} ok · ${BATCH_SKIPC} skipped · ${BATCH_FAILC} failed) · ${#inflight[@]} running · ${queued} queued — of ${n}${A_RST}"
+  fi
+
+  [ "$first" -eq 0 ] && [ "$BATCH_LASTN" -gt 0 ] && printf '\033[%dA' "$BATCH_LASTN"
+  local printed=0
+  for idx in ${show[@]+"${show[@]}"}; do
+    printf -v lbl '%-24s' "${BATCH_LABELS[$idx]}"
+    state="${BATCH_STATE[$idx]:-}"
+    if [ -n "$state" ]; then
+      msg="${BATCH_MSG[$idx]}"
+      case "$state" in
+        ok)    line="${A_GREEN}${G_OK}${A_RST} ${lbl} ${A_DIM}${msg}${A_RST}" ;;
+        skip)  line="${A_YELLOW}${G_WARN}${A_RST} ${lbl} ${A_YELLOW}skipped${A_RST} ${A_DIM}· ${msg}${A_RST}" ;;
+        *)     line="${A_REDX}${G_FAIL}${A_RST} ${lbl} ${A_REDX}${msg}${A_RST}" ;;
       esac
     elif [ -f "$outdir/$idx.start" ]; then
       # live progress: git clone --progress streams to the worker's .err —
@@ -1100,14 +1212,18 @@ batch::render() {  # $1=outdir $2=first(1|0)
                 | grep -v '^[[:space:]]*$' | tail -1 | LC_ALL=C tr -d '\000-\037' || true)"
       fi
       if [ -z "$prog" ]; then
-        case "$item" in clone*) prog="cloning…" ;; pull*) prog="pulling…" ;; *) prog="working…" ;; esac
+        case "${BATCH_ITEMS[$idx]}" in clone*) prog="cloning…" ;; pull*) prog="pulling…" ;; *) prog="working…" ;; esac
       fi
-      line="${A_CYAN}${SPIN_FRAMES[$SPIN_I]}${A_RST} $(printf '%-24s' "$label") ${A_DIM}$(ui::trunc "$prog" "$progw")${A_RST}"
+      line="${A_CYAN}${SPIN_FRAMES[$SPIN_I]}${A_RST} ${lbl} ${A_DIM}$(ui::trunc "$prog" "$progw")${A_RST}"
     else
-      line="${A_FAINT}${G_PEND}${A_RST} $(printf '%-24s' "$label") ${A_FAINT}queued${A_RST}"
+      line="${A_FAINT}${G_PEND}${A_RST} ${lbl} ${A_FAINT}queued${A_RST}"
     fi
     printf '\033[2K  %s\n' "$line"
+    printed=$((printed+1))
   done
+  if [ -n "$footer" ]; then printf '\033[2K%s\n' "$footer"; printed=$((printed+1)); fi
+  printf '\033[J'   # erase leftovers when this frame printed fewer lines than the last
+  BATCH_LASTN="$printed"
 }
 
 batch::summary() {  # $1 = title ; prints semantic-colored box from BATCH_RESULTS
@@ -1276,7 +1392,7 @@ mod::sync() {
           org="$SEL"
           [ "$SEL_WAS_MENU" -eq 1 ] && NAV+=(org)
         fi
-        [[ "$org" =~ ^[A-Za-z0-9._-]+$ ]] || { log::err "invalid org name: $org"; return 1; }
+        org::valid "$org" || { log::err "invalid org name: $org"; return 1; }
         STEP=project ;;
       project)
         project=""
@@ -1390,12 +1506,12 @@ sync::browse() {  # $1=provider $2=org $3=project — fetch, table, select, exec
   ui::page "Sync" "multi-select repos, then batch clone (missing) / pull (cloned) — dirty repos are skipped, never touched" \
     "$provider/$org${project:+/$project} · ${#lines[@]} repos"
   export REPOKNIFE_TSV="$tmptsv" REPOKNIFE_CTX="$provider $org $project" REPOKNIFE_FORCE_COLOR=1
-  local sel
+  local sel qself; printf -v qself '%q' "$SELF"
   sel="$(printf '%s\n' "${lines[@]}" | ui::pick --multi \
         --delimiter='\t' --with-nth=2 \
         --header="type to search · space/tab select · ctrl-a all · ctrl-d none · enter run · esc back" \
         --bind 'space:toggle+down,ctrl-a:select-all,ctrl-d:deselect-all' \
-        --preview "\"$SELF\" __preview sync {1}" \
+        --preview "$qself __preview sync {1}" \
         --preview-window='right,45%,border-left,wrap' \
         | cut -f1)" || { unset REPOKNIFE_FORCE_COLOR; return 130; }   # ESC → one level up
   unset REPOKNIFE_FORCE_COLOR
@@ -1406,11 +1522,18 @@ sync::browse() {  # $1=provider $2=org $3=project — fetch, table, select, exec
 mod::sync_execute() {  # $1=provider $2=org $3=project $4=tsvfile $5=selection|__ALL__
   local provider="$1" org="$2" project="$3" tmptsv="$4" sel="$5"
   local name fork arch empty defbranch pushed url desc rel dir
+  # selection membership via one assoc map — a grep fork per TSV row stalled
+  # multi-second on 1000-repo orgs before anything rendered
+  declare -A want=()
+  local w
+  if [ "$sel" != "__ALL__" ]; then
+    while IFS= read -r w; do [ -n "$w" ] && want["$w"]=1; done <<< "$sel"
+  fi
   BATCH_ITEMS=()
   while IFS=$'\t' read -r name fork arch empty defbranch pushed url desc; do
     [ -z "$name" ] && continue
     if [ "$sel" != "__ALL__" ]; then
-      grep -qxF "$name" <<< "$sel" || continue
+      [ -n "${want[$name]:-}" ] || continue
     fi
     [ "$empty" = "1" ] && continue   # nothing to clone/pull on an empty repo
     if [ -n "$project" ]; then rel="$provider/$org/$project/$name"; else rel="$provider/$org/$name"; fi
@@ -1474,9 +1597,13 @@ init::rollback() {  # remove the .git WE just created so the folder stays a clea
 }
 
 mod::init() {
-  local cands=() c
-  while IFS= read -r c; do [ -n "$c" ] && cands+=("$c"); done \
-    < <(ui::spin "Scanning $CODE_ROOT for non-git folders…" "$SELF" __initscan)
+  local cands=() c scan
+  # spinner hoisted into a main-shell $() (gotcha #14: gum spin inside a process
+  # substitution corrupts the TTY) — and a failed scan must error loudly, not
+  # read as "tree is clean" (the proc-sub form swallowed the child's rc)
+  scan="$(ui::spin "Scanning $CODE_ROOT for non-git folders…" "$SELF" __initscan)" \
+    || { log::err "init scan failed — re-run with --plain to see why"; return 1; }
+  while IFS= read -r c; do [ -n "$c" ] && cands+=("$c"); done <<< "$scan"
   if [ "${#cands[@]}" -eq 0 ]; then log::ok "no non-git folders found — tree is clean"; return 0; fi
 
   if ! ui::is_interactive; then
@@ -1488,18 +1615,21 @@ mod::init() {
   ui::page "Init" "turn plain folders into gitflow repos: init main → commit → develop (default) · then optional GitHub remote" \
     "${#cands[@]} candidate(s)"
   export REPOKNIFE_FORCE_COLOR=1
-  local sel
+  local sel qself; printf -v qself '%q' "$SELF"
   sel="$(printf '%s\n' "${cands[@]}" | ui::pick --multi \
         --bind 'space:toggle+down,ctrl-a:select-all,ctrl-d:deselect-all' \
         --header="type to search · space/tab select · ctrl-a all · enter continue · esc back" \
-        --preview "\"$SELF\" __preview init {}" \
+        --preview "$qself __preview init {}" \
         --preview-window='right,45%,border-left,wrap')" || { unset REPOKNIFE_FORCE_COLOR; return 0; }
   unset REPOKNIFE_FORCE_COLOR
   [ -z "$sel" ] && return 0
 
   local rel dir vis choice remote_jobs=() results=()
   local default_vis; default_vis="$(cfg::get default_visibility private)"
-  while IFS= read -r rel; do
+  # read the selection on fd 3, NOT fd 0: the per-folder gum menu below inherits
+  # stdin, and gum drains a non-TTY fd 0 even with args — with `done <<< "$sel"`
+  # only the FIRST selected folder would survive the loop (rest eaten by gum)
+  while IFS= read -r rel <&3; do
     [ -z "$rel" ] && continue
     dir="$CODE_ROOT/$rel"
     path::parse "$rel" || { log::err "$rel: cannot parse path"; continue; }
@@ -1527,7 +1657,7 @@ mod::init() {
     else
       results+=("$G_OK $rel · local only (remote creation not supported for $PROVIDER in v1)")
     fi
-  done <<< "$sel"
+  done 3<<< "$sel"
 
   # --- batch confirm + create remotes ---
   if [ "${#remote_jobs[@]}" -gt 0 ]; then
@@ -1541,15 +1671,18 @@ mod::init() {
     done
     if ui::confirm "Create ${#remote_jobs[@]} remote repo(s) on GitHub?" "Create"; then
       auth::check_gh || return 2
-      local out
+      local out errf emsg; errf="$(tmp::dir)/createremote.err"
       for job in "${remote_jobs[@]}"; do
         IFS=$'\t' read -r rel vis <<< "$job"
         path::parse "$rel" || continue
-        if out="$(ui::spin "Creating $ORG/$REPO ($vis)…" \
-             "$SELF" __createremote "$ORG" "$REPO" "$CODE_ROOT/$rel" "$vis" 2>&1)"; then
+        if out="$(ui::spin_err "$errf" "Creating $ORG/$REPO ($vis)…" \
+             "$SELF" __createremote "$ORG" "$REPO" "$CODE_ROOT/$rel" "$vis")"; then
           results+=("$G_OK $rel · remote created · pushed · default=develop")
         else
-          results+=("$G_FAIL $rel · remote: $(tail -1 <<< "$out")")
+          # diagnosis: gh/git stderr if any, else the worker's own stdout reason
+          emsg="$(tail -1 "$errf" 2>/dev/null || true)"
+          [ -z "$emsg" ] && emsg="$(tail -1 <<< "$out")"
+          results+=("$G_FAIL $rel · remote: $emsg")
         fi
       done
     else
@@ -1565,6 +1698,18 @@ $(printf '%s\n' "${results[@]}")"
 # --------------------------------------------------------------------- mod::pr
 PR_JSON_FIELDS="number,title,repository,isDraft,updatedAt,author"
 
+# normalized PR-list jq → 3-col TSV (number · nameWithOwner · display row), a
+# JQ_* constant so the selftest schema-checks it like its siblings. $tw is a jq
+# variable supplied via --argjson, hence the single-quote SC2016 disable.
+# shellcheck disable=SC2016
+JQ_PR_LIST='.[] | [
+      (.number|tostring),
+      ((.repository.nameWithOwner // "") | gsub("[[:cntrl:]]"; " ")),
+      ((if .isDraft then "○ " else "● " end) + (.repository.name // "?") + " #" + (.number|tostring)
+        + "  " + (((.title // "") | gsub("[[:cntrl:]]"; " "))[:$tw])
+        + "  @" + ((.author.login // "?") | gsub("[[:cntrl:]]"; " ")))
+    ] | @tsv'
+
 pr::fetch() {  # $1 = scope: all|mine|review|assigned|mentions → JSON array on stdout
   local a b
   case "$1" in
@@ -1574,8 +1719,10 @@ pr::fetch() {  # $1 = scope: all|mine|review|assigned|mentions → JSON array on
     mentions) gh search prs --mentions=@me         --state=open --limit 100 --sort updated --json "$PR_JSON_FIELDS" ;;
     all)
       # involves: author+assignee+mentions+commenter — review-requested is NOT included, merge it
-      a="$(gh search prs --involves=@me --state=open --limit 100 --json "$PR_JSON_FIELDS")" || a="[]"
-      b="$(gh search prs --review-requested=@me --state=open --limit 100 --json "$PR_JSON_FIELDS")" || b="[]"
+      # --sort updated like the sibling scopes: past the 100-result truncation,
+      # search-relevance order would keep arbitrary matches over recent ones
+      a="$(gh search prs --involves=@me --state=open --limit 100 --sort updated --json "$PR_JSON_FIELDS")" || a="[]"
+      b="$(gh search prs --review-requested=@me --state=open --limit 100 --sort updated --json "$PR_JSON_FIELDS")" || b="[]"
       jq -s '.[0] + .[1] | unique_by(.repository.nameWithOwner + "#" + (.number|tostring))
              | sort_by(.updatedAt) | reverse' <<< "$a
 $b" ;;
@@ -1630,12 +1777,7 @@ mod::pr() {
 
     local lines=() titlew
     titlew=$(( $(ui::cols) >= 160 ? 90 : $(ui::cols) >= 120 ? 64 : 48 ))
-    while IFS= read -r row; do lines+=("$row"); done < <(jq -r --argjson tw "$titlew" '.[] | [
-        (.number|tostring), .repository.nameWithOwner,
-        ((if .isDraft then "○ " else "● " end) + (.repository.name) + " #" + (.number|tostring)
-          + "  " + (((.title // "") | gsub("[[:cntrl:]]"; " "))[:$tw])
-          + "  @" + ((.author.login // "?") | gsub("[[:cntrl:]]"; " ")))
-      ] | @tsv' <<< "$json")
+    while IFS= read -r row; do lines+=("$row"); done < <(jq -r --argjson tw "$titlew" "$JQ_PR_LIST" <<< "$json")
 
     if ! ui::is_interactive; then
       printf '%s\n' "${lines[@]}" | awk -F'\t' '{print $2 " #" $1 "\t" $3}'
@@ -1693,17 +1835,17 @@ mod::pr_actions() {  # $1=number $2=owner/repo
         ;;
       *diff*)   ( gh pr diff "$num" -R "$nwo" --color always | less -R ) || true ;;
       *Approve*)
-        local aerr
-        if aerr="$(ui::spin "Approving #${num}…" gh pr review "$num" -R "$nwo" --approve 2>&1)"; then
+        local aerrf; aerrf="$(tmp::dir)/gh.err"
+        if ui::spin_err "$aerrf" "Approving #${num}…" gh pr review "$num" -R "$nwo" --approve >/dev/null; then
           ui::toast ok "approved #$num"
-        else fix::offer_gh_postmortem "$aerr" "approve failed"; fi
+        else fix::offer_gh_postmortem "$(cat "$aerrf" 2>/dev/null || true)" "approve failed"; fi
         ;;
       *Merge*)
         if ui::confirm "$stratlabel #$num into $base$delmsg?" "Merge"; then
-          local merr
-          if merr="$(ui::spin "Merging #${num}…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} 2>&1)"; then
+          local merrf; merrf="$(tmp::dir)/gh.err"
+          if ui::spin_err "$merrf" "Merging #${num}…" gh pr merge "$num" -R "$nwo" "$strategy" ${del:+"$del"} >/dev/null; then
             ui::toast ok "merged #$num into $base"; return 0
-          else fix::offer_gh_postmortem "$merr" "merge failed (checks pending / not mergeable?)"; fi
+          else fix::offer_gh_postmortem "$(cat "$merrf" 2>/dev/null || true)" "merge failed (checks pending / not mergeable?)"; fi
         fi
         ;;
       *browser*) gh pr view "$num" -R "$nwo" --web >/dev/null 2>&1 || true ;;
@@ -1728,7 +1870,6 @@ mod::runs() {
   [ "${#nwos[@]}" -eq 0 ] && { log::warn "no local repos for github/$org — clone some first (sync)"; return 0; }
 
   local rows
-  BATCH_ITEMS=()
   rows="$(printf '%s\n' "${nwos[@]}" | ui::spin "Fetching runs across ${#nwos[@]} repos…" \
           "$SELF" __fanout runs)" || rows=""
   [ -z "$rows" ] && { log::warn "no workflow runs found"; return 0; }
@@ -1815,7 +1956,10 @@ mod::health() {
   [ "${#repos[@]}" -eq 0 ] && { log::warn "no local repos found under $CODE_ROOT"; return 0; }
 
   local discovered=${#repos[@]} rows
-  rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${discovered} repos…" "$SELF" __fanout status)"
+  # guarded like its mod::runs sibling: as a CLI subcommand errexit is live, and
+  # an unguarded assignment would die silently INSTEAD of reaching the explicit
+  # fan-out-failure diagnostic below (which honors --exit-code for CI)
+  rows="$(printf '%s\n' "${repos[@]}" | ui::spin "Scanning ${discovered} repos…" "$SELF" __fanout status)" || rows=""
   rows="$(LC_ALL=C sort -t$'\t' -k9,9n -k1,1 <<< "$rows")"   # C locale: byte-deterministic, BSD/GNU-identical, broken-locale-safe
   # a totally empty result for a non-empty tree is a fan-out FAILURE, not "all clean"
   if [ -z "${rows//[[:space:]]/}" ]; then
@@ -1840,10 +1984,12 @@ mod::health() {
     [ "$rank" -lt 6 ] 2>/dev/null && attention=$((attention+1))
   done <<< "$rows"
 
-  # persist counts for the instant main-menu header
+  # persist counts for the instant main-menu header (tmp+mv like cache::put —
+  # a concurrent menu::counts must never read a partially-written file)
   mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"
   printf '{"at":%s,"repos":%s,"scanned":%s,"dirty":%s,"behind":%s,"attention":%s,"errored":%s}\n' \
-    "$(date +%s)" "$discovered" "$total" "$dirty" "$behind" "$attention" "$errored" > "$CACHE_DIR/counts.json"
+    "$(date +%s)" "$discovered" "$total" "$dirty" "$behind" "$attention" "$errored" \
+    > "$CACHE_DIR/counts.json.tmp.$$" && mv "$CACHE_DIR/counts.json.tmp.$$" "$CACHE_DIR/counts.json"
 
   # display lines (column widths scale with the terminal)
   local cols repow brw
@@ -1971,6 +2117,9 @@ mod::cleanup() {
   path::parse "$rel" || { log::err "not a repo path under $CODE_ROOT: $rel (expected <provider>/<org>[/<project>]/<repo>)"; return 1; }
   local dir="$CODE_ROOT/$rel"
   git::is_repo "$dir" || { log::err "$rel is not a git repo"; return 1; }
+  # with a path arg in plain mode the menu below would fail generically and
+  # exit 0 having done nothing — fail like the no-arg plain path does (rc 1)
+  ui::is_interactive || { log::err "cleanup is interactive-only"; return 1; }
 
   while :; do
     local act
@@ -2115,6 +2264,10 @@ mod::config() {
           fi
         fi
         cfg::set "$key" "$val"
+        # a code_root change must re-point the LIVE process too (bootstrap
+        # honors the env pin) — health/sync in this same session would
+        # otherwise keep using the old tree until a restart
+        [ "$key" = "code_root" ] && cfg::bootstrap
         ui::toast ok "$key = $val"
         ;;
     esac
@@ -2359,6 +2512,9 @@ menu::counts() {
 }
 
 menu::loop() {
+  # piped/CI invocation must never reach the bare gum calls below — gum is only
+  # a hard dependency when interactive, so on a gum-less box this would die 127
+  ui::is_interactive || { log::err "interactive menu unavailable in plain mode — use a subcommand (see --help)"; return 1; }
   ui::banner
   while :; do
     gum style --foreground "$C_DIM" --margin "0 0 1 2" "$(menu::counts)"
@@ -2425,11 +2581,11 @@ cli::help() {
     config   [list]               orgs · ADO defaults · fork filter
 
   FLAGS
-    --org <org>        target org/account        --provider <p>   github|azure-devops|gitlab
+    --org <org>        target org/account        --provider <p>   github|azure-devops|gitlab (gitlab = stub)
     --no-forks         exclude forks (sync)      --refresh        bypass the repo-list cache
-    --dry-run          print actions, change nothing
+    --dry-run          print actions, change nothing (honored by sync · init)
     --all              non-interactive: act on every actionable repo (sync)
-    --plain            no color/TUI (auto when piped; NO_COLOR honored)
+    --plain            no color/TUI (auto when piped; alias --no-color; NO_COLOR honored)
     --exit-code        health: exit with the attention count (CI gate)
     -h --help          this screen                -V --version    print version
 
@@ -2439,6 +2595,8 @@ cli::help() {
     <code-root>/azure-devops/<org>/<project>/<repo>   ADO (3-level)
     code root: ~/Code by default · config code_root · REPOKNIFE_CODE_ROOT env wins
     config:    ~/.repoknife.conf (installed) · repo-adjacent .repoknife.conf (dev runs)
+    env:       REPOKNIFE_CFG_FILE (config path) · REPOKNIFE_CACHE_TTL (s, default 3600)
+               REPOKNIFE_JOBS (parallel workers, default 8) · REPOKNIFE_NO_DISCOVER=1 (offline ADO)
     gitflow: main + develop (develop = default branch)
 
   DEPS  gum · fzf · jq · gh · git   (az optional, for Azure DevOps)
@@ -2495,6 +2653,9 @@ cli::__preview() {
         [ "$name" = "$key" ] || continue
         printf '%s%s%s\n' "$A_BOLD" "$name" "$A_RST"
         printf '%s%s%s\n\n' "$A_FAINT" "──────────────────────────────────────" "$A_RST"
+        # undo jq @tsv backslash-escaping for display (\t/\n can't appear:
+        # control chars were gsub'd to spaces at ingestion — only \\ remains)
+        desc="${desc//$'\\\\'/$'\\'}"
         [ -n "$desc" ] && printf '%s\n\n' "$desc"
         printf '  %sdefault%s  %s\n' "$A_DIM" "$A_RST" "$defbranch"
         printf '  %spushed%s   %s ago\n' "$A_DIM" "$A_RST" "$(ui::age "$pushed")"
@@ -2560,6 +2721,14 @@ cli::dispatch() {
   # freeze interactivity now, on the REAL stdin/stdout — before any $() capture
   if [ "$PLAIN" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
   palette::init
+  # --provider is interpolated into provider_<p>_<verb> names and cache paths —
+  # reject anything outside the known set before it reaches either
+  if [ -n "$ARG_PROVIDER" ]; then
+    case " ${PROVIDERS[*]} " in
+      *" $ARG_PROVIDER "*) : ;;
+      *) log::die "unknown provider: $ARG_PROVIDER (github · azure-devops · gitlab)" ;;
+    esac
+  fi
   deps::check
   cfg::load
   cfg::bootstrap
@@ -2595,6 +2764,7 @@ selftest::run() {
   mkdir -p "$fix/github/acme/widget/.git" \
            "$fix/github/acme/plainfolder" \
            "$fix/github/acme/.hidden/repo" \
+           "$fix/github/.archive/legacy/.git" \
            "$fix/azure-devops/corp/Proj/api/.git" \
            "$fix/azure-devops/corp/Proj/scratch" \
            "$fix/gitlab/grp/No Project/tool/.git"
@@ -2623,6 +2793,11 @@ selftest::run() {
     || t::check "parse traversal rejected" "rc1" "rc1"
   path::parse "github/acme/.." && t::check "parse dotdot repo rejected" "rc1" "rc0" \
     || t::check "parse dotdot repo rejected" "rc1" "rc1"
+
+  # --- org::valid (a leading '-' must not reach gh looking like a flag) ---
+  org::valid acme         && t::check "org valid plain" "rc0" "rc0" || t::check "org valid plain" "rc0" "rc1"
+  org::valid -foo         && t::check "org leading dash rejected" "rc1" "rc0" || t::check "org leading dash rejected" "rc1" "rc1"
+  org::valid 'a b'        && t::check "org space rejected" "rc1" "rc0" || t::check "org space rejected" "rc1" "rc1"
 
   # --- cfg: allowlist + no code execution ---
   CFG_FILE="$fix/test.conf"
@@ -2696,6 +2871,10 @@ EOF
   t::check "disco providers" "azure-devops github gitlab" "$(disco::providers | sort | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco orgs union+dedup" "acme other-org" "$(disco::orgs github | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco ado projects" "Proj" "$(disco::ado_projects corp | tr '\n' ' ' | sed 's/ $//')"
+  # the template documents the SPACED map format — entries after a ", " must not vanish
+  CFG[ado_project_map]='corp:Proj, corp:Other, other-org:X'
+  t::check "disco ado projects (spaced map)" "Other Proj" "$(disco::ado_projects corp | tr '\n' ' ' | sed 's/ $//')"
+  CFG[ado_project_map]='corp:Proj'
   t::check "disco local repos" "azure-devops/corp/Proj/api github/acme/widget gitlab/grp/No Project/tool" \
     "$(disco::local_repos | sort | tr '\n' ' ' | sed 's/ $//')"
   t::check "disco init candidates (depth-exact, no dotdirs)" \
@@ -2752,11 +2931,15 @@ EOF
   t::check "age relative 2h"   "2h"   "$(ui::age "$(( $(date +%s) - 7200 ))")"
   t::check "strip_ansi OSC"    "X"    "$(printf '\033]0;pwn\007X' | ui::strip_ansi)"
   t::check "strip_ansi CSI"    "red"  "$(printf '\033[31mred\033[0m' | ui::strip_ansi)"
+  # cursor-movement CSI followed by uppercase text: the old [ -\/] class spanned
+  # space..BACKSLASH and ate the text after the sequence
+  t::check "strip_ansi cursor CSI" "HELLO" "$(printf '\033[2AHELLO' | ui::strip_ansi)"
   # --version line 1 must stay exactly "repoknife X.Y.Z" (the brew formula test asserts it)
   t::check "version line shape" "yes" "$(v="$(ver::print)"; v="${v%%$'\n'*}"; [[ "$v" =~ ^repoknife[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] && echo yes || echo no)"
 
   # --- cache::file sanitization: config-supplied org/project must not escape CACHE_DIR ---
   t::check "cache key slash to _"   "$fix/c/github__a_b_c__x.tsv"   "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github 'a/b/c' 'x')"
+  t::check "cache key provider sanitized" "$fix/c/.._.._pwn__o.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file '../../pwn' o '')"
   t::check "cache key no traversal" "$fix/c/github__.._.._etc.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=0 cache::file github '../../etc' '')"
   t::check "cache key fork suffix"  "$fix/c/github__o__nofork.tsv" "$(CACHE_DIR="$fix/c" EXCLUDE_FORKS=1 cache::file github o '')"
   # live-discovery cache namespaces (fork suffix still appended under --no-forks — harmless duplication, locked here)
@@ -2772,6 +2955,18 @@ EOF
       "$(printf '%s' '[{"name":"r","isFork":false,"isArchived":false,"isEmpty":false,"defaultBranchRef":null,"pushedAt":"-","sshUrl":"u","description":"d\u0007e"}]' | jq -r "$JQ_REPO_LIST" | cut -f8)"
     t::check "runs TSV cols" "7" \
       "$(printf '%s' '[{"databaseId":1,"status":"completed","conclusion":"success","displayTitle":"t","workflowName":"w","headBranch":"b","createdAt":"2024-01-01T00:00:00Z"}]' | jq -r --arg r 'o/r' "$JQ_RUNS" | awk -F'\t' '{print NF; exit}')"
+    # empty mid-row fields must default to "-": tab is IFS whitespace, so an
+    # empty field would collapse under `IFS=$'\t' read` and shift every column
+    t::check "runs TSV empty fields default" "-|-" \
+      "$(printf '%s' '[{"databaseId":1,"status":"completed","conclusion":"success","displayTitle":"t","workflowName":"","headBranch":null,"createdAt":"2024-01-01T00:00:00Z"}]' | jq -r --arg r 'o/r' "$JQ_RUNS" | awk -F'\t' '{print $4 "|" $5; exit}')"
+    # ADO repo-list producer: 8 cols, cntrl-sanitized name, disabled filtered out
+    t::check "ado repo-list TSV cols" "8" \
+      "$(printf '%s' '[{"name":"r","isDisabled":false,"size":0,"defaultBranch":"refs/heads/main","sshUrl":"u"}]' | jq -r "$JQ_ADO_REPO_LIST" | awk -F'\t' '{print NF; exit}')"
+    t::check "ado repo-list cntrl+disabled" "1:a b" \
+      "$(printf '%s' '[{"name":"dead","isDisabled":true,"size":1,"sshUrl":"u"},{"name":"a\u0007b","size":1,"sshUrl":"u"}]' | jq -r "$JQ_ADO_REPO_LIST" | awk -F'\t' 'END{print NR":"$1}')"
+    # PR-list producer: 3 cols, cntrl stripped from the title in the display row
+    t::check "pr-list TSV cols" "3" \
+      "$(printf '%s' '[{"number":7,"title":"t\u0007x","repository":{"name":"r","nameWithOwner":"o/r"},"isDraft":false,"author":{"login":"me"}}]' | jq -r --argjson tw 90 "$JQ_PR_LIST" | awk -F'\t' '{print NF; exit}')"
     # live-discovery producers: one name per line, control chars sanitized
     t::check "ado-projects names+cntrl" "2:a b" \
       "$(printf '%s' '{"value":[{"name":"Orchestra"},{"name":"a\u0007b"}]}' | jq -r "$JQ_ADO_PROJECTS" | awk 'NR==2{s=$0} END{print NR":"s}')"
@@ -2782,6 +2977,15 @@ EOF
   # --- worker dry/dispatch branches (pure) ---
   t::check "clone dry-run"           $'ok\tgithub/acme/new\tDRY: would clone' "$(DRY_RUN=1 worker::do_clone $'github/acme/new\turl\tmain')"
   t::check "syncitem unknown action" "error" "$(worker::do_syncitem $'bogus\tx' | cut -f1)"
+
+  # --- batch renderer pure helpers (label extraction/truncation + window math) ---
+  t::check "batch label clone item" "widget"  "$(batch::label $'clone\tgithub/acme/widget\turl\tmain')"
+  t::check "batch label pull item"  "tool"    "$(batch::label $'pull\tgitlab/grp/No Project/tool')"
+  t::check "batch label truncates"  "abcdefg…" "$(batch::label $'pull\tgithub/o/abcdefghij' 8)"
+  t::check "winmath all fit"        "3 6"     "$(batch::winmath 10 3 6)"
+  t::check "winmath inflight capped" "9 0"    "$(batch::winmath 10 20 50)"
+  t::check "winmath done fills rest" "2 7"    "$(batch::winmath 10 2 50)"
+  t::check "winmath tiny terminal"  "1 0"     "$(batch::winmath 1 5 5)"
 
   # --- worker fanout round-trip (xargs + item files preserve tabs) ---
   local fan
@@ -2844,6 +3048,33 @@ EOF
     git::merged_into "$repo2" feat main && t::check "merged_into ancestor" "yes" "yes" || t::check "merged_into ancestor" "yes" "no"
     ( cd "$repo2" && git checkout -q feat && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m ahead && git checkout -q main ) || true
     git::merged_into "$repo2" feat main && t::check "merged_into not-merged" "no" "yes" || t::check "merged_into not-merged" "no" "no"
+
+    # --- git::branch_rows trackclass ladder (guards branch deletion in cleanup) ---
+    # local bare "remote" → sync / gone / "ahead 1" / local all on one fixture
+    local bare="$fix/remote.git" repo3="$fix/github/acme/tracked"
+    git init -q --bare "$bare"
+    git init -q -b main "$repo3"
+    ( cd "$repo3" \
+      && git remote add origin "$bare" \
+      && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init \
+      && git push -q -u origin main \
+      && git checkout -q -b feat-gone && git push -q -u origin feat-gone && git checkout -q main \
+      && git push -q origin :feat-gone && git fetch -q -p \
+      && git checkout -q -b ahead1 && git push -q -u origin ahead1 \
+      && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m more \
+      && git checkout -q main \
+      && git branch -q localb ) || true
+    t::check "branch_rows trackclasses" "ahead1:ahead 1 feat-gone:gone localb:local main:sync" \
+      "$(git::branch_rows "$repo3" | awk -F'\t' '{print $1 ":" $3}' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+    # --- worker::do_status EMPTY/unborn row: 10 cols, rank 7, symbolic-ref name ---
+    # (rev-parse lies "HEAD" on an unborn branch — the row must carry the real name)
+    local repo4="$fix/github/acme/unborn" erow
+    git init -q -b trunk "$repo4"
+    erow="$(worker::do_status "github/acme/unborn")"
+    t::check "status EMPTY row fields" "10" "$(awk -F'\t' '{print NF}' <<< "$erow")"
+    t::check "status EMPTY rank+label" "7|EMPTY" "$(awk -F'\t' '{print $9 "|" $10}' <<< "$erow")"
+    t::check "status EMPTY branch name" "trunk" "$(cut -f2 <<< "$erow")"
   fi
 
   printf '\n%d passed, %d failed\n' "$T_PASS" "$T_FAIL"
