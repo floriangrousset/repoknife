@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 driven by [Conventional Commits](https://www.conventionalcommits.org).
 
+## [1.8.2] - 2026-06-12
+
+### Bug Fixes
+
+- **core**: Batch-4 low-severity fixes, hardening, dead-code removal ([`2e4a2b0`](https://github.com/floriangrousset/repoknife/commit/2e4a2b07f3579baf9b9561b289004684ad04ed2d))
+- **core**: Batch-2 medium-severity audit fixes (14 items) ([`42253b1`](https://github.com/floriangrousset/repoknife/commit/42253b1cc54e0e8c5d3020f520d6a8f4abda2adc))
+- **core**: Batch-1 high-severity audit fixes (map trim, init stdin, renderer) ([`5a050ad`](https://github.com/floriangrousset/repoknife/commit/5a050ad83dfdc84fbb8c2ee5c29d3a960c4ee235))
+
+### Documentation
+
+- Sync README, CLAUDE.md, and --help with actual behavior (audit batch 5) ([`5f99bce`](https://github.com/floriangrousset/repoknife/commit/5f99bce62daec7ca46d3c6c544d4926935ce107f))
+
+### Testing
+
+- **selftest**: Lock branch_rows trackclasses and the EMPTY status row ([`022c768`](https://github.com/floriangrousset/repoknife/commit/022c7682873b604461b5752ca3cb8f6c33f0037a))
+
+### CI & Build
+
+- **release**: Harden the release/tap pipeline (audit batch 3) ([`d371e11`](https://github.com/floriangrousset/repoknife/commit/d371e11999e9a77b7776819b9e52b1bc0e6fd7a7))
+
 ## [1.8.1] - 2026-06-09
 
 ### Bug Fixes
@@ -55,6 +75,8 @@ driven by [Conventional Commits](https://www.conventionalcommits.org).
 ### Documentation
 
 - Add CLAUDE.md dev guide and .gitignore ([`a42ad74`](https://github.com/floriangrousset/repoknife/commit/a42ad7425be93f162353657deec0f120d7c0c104))
+
+[1.8.2]: https://github.com/floriangrousset/repoknife/compare/v1.8.1..v1.8.2
 
 [1.8.1]: https://github.com/floriangrousset/repoknife/compare/v1.8.0..v1.8.1
 
