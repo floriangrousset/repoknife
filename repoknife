@@ -3048,6 +3048,33 @@ EOF
     git::merged_into "$repo2" feat main && t::check "merged_into ancestor" "yes" "yes" || t::check "merged_into ancestor" "yes" "no"
     ( cd "$repo2" && git checkout -q feat && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m ahead && git checkout -q main ) || true
     git::merged_into "$repo2" feat main && t::check "merged_into not-merged" "no" "yes" || t::check "merged_into not-merged" "no" "no"
+
+    # --- git::branch_rows trackclass ladder (guards branch deletion in cleanup) ---
+    # local bare "remote" → sync / gone / "ahead 1" / local all on one fixture
+    local bare="$fix/remote.git" repo3="$fix/github/acme/tracked"
+    git init -q --bare "$bare"
+    git init -q -b main "$repo3"
+    ( cd "$repo3" \
+      && git remote add origin "$bare" \
+      && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init \
+      && git push -q -u origin main \
+      && git checkout -q -b feat-gone && git push -q -u origin feat-gone && git checkout -q main \
+      && git push -q origin :feat-gone && git fetch -q -p \
+      && git checkout -q -b ahead1 && git push -q -u origin ahead1 \
+      && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m more \
+      && git checkout -q main \
+      && git branch -q localb ) || true
+    t::check "branch_rows trackclasses" "ahead1:ahead 1 feat-gone:gone localb:local main:sync" \
+      "$(git::branch_rows "$repo3" | awk -F'\t' '{print $1 ":" $3}' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+    # --- worker::do_status EMPTY/unborn row: 10 cols, rank 7, symbolic-ref name ---
+    # (rev-parse lies "HEAD" on an unborn branch — the row must carry the real name)
+    local repo4="$fix/github/acme/unborn" erow
+    git init -q -b trunk "$repo4"
+    erow="$(worker::do_status "github/acme/unborn")"
+    t::check "status EMPTY row fields" "10" "$(awk -F'\t' '{print NF}' <<< "$erow")"
+    t::check "status EMPTY rank+label" "7|EMPTY" "$(awk -F'\t' '{print $9 "|" $10}' <<< "$erow")"
+    t::check "status EMPTY branch name" "trunk" "$(cut -f2 <<< "$erow")"
   fi
 
   printf '\n%d passed, %d failed\n' "$T_PASS" "$T_FAIL"

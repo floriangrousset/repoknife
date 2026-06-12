@@ -5,7 +5,7 @@ Single-file bash TUI (`./repoknife`, ~2,900 lines) managing a `<code-root>/<prov
 ## Verification loop — run after EVERY edit
 
 ```bash
-./repoknife _selftest      # 102 checks, must be 0 failed (fixtures in mktemp under RK_TMP_ROOT, reaped on exit)
+./repoknife _selftest      # 123 checks, must be 0 failed (fixtures in mktemp under RK_TMP_ROOT, reaped on exit)
 shellcheck repoknife       # must be clean (justified disables only, with comment)
 /bin/bash ./repoknife --version   # must print the friendly "requires bash >= 4.4" guard, NOT a syntax error
 ```
