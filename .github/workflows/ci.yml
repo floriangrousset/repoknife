@@ -13,36 +13,42 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4.3.1 (SHA-pinned)
       # Pin shellcheck so lint results are reproducible across runner-image bumps
       # (a newer default-enabled check could turn the script red overnight, or a
       # relaxed one let a real issue through). Keep the explicit `shellcheck
       # repoknife` invocation so dev (Makefile) and CI lint the same way.
-      - name: shellcheck (pinned)
+      - name: shellcheck (pinned + checksummed)
         run: |
           ver=v0.10.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz" | tar -xJ
+          sha256=6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+          curl -fsSL --retry 3 --retry-delay 2 -o shellcheck.tar.xz "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz"
+          echo "$sha256  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
           "shellcheck-${ver}/shellcheck" --version
           "shellcheck-${ver}/shellcheck" repoknife
 
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4.3.1 (SHA-pinned)
       # Lint the workflow YAML AND the non-trivial shell embedded in `run:` blocks
       # (release.yml's formula-rewrite sed + curl|sha256 pipeline). ubuntu-latest
       # ships shellcheck, which actionlint uses for the embedded-shell checks.
-      - name: actionlint (pinned)
+      - name: actionlint (pinned + checksummed)
         run: |
           ver=1.7.7
-          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz" | tar -xz actionlint
+          sha256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          curl -fsSL --retry 3 --retry-delay 2 -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
+          echo "$sha256  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
           ./actionlint --version
           ./actionlint -color
 
   selftest-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4.3.1 (SHA-pinned)
       # ubuntu-latest ships bash >= 5; git + xargs are present. Network-free.
       - name: bash version
         run: bash --version | head -1
@@ -52,7 +58,7 @@ jobs:
   selftest-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4.3.1 (SHA-pinned)
       # macOS runners ship system bash 3.2 -> install modern bash via brew and
       # run the selftest under it (the >=4.4 guard would reject /bin/bash).
       - name: install bash
@@ -69,7 +75,7 @@ jobs:
   guard-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4.3.1 (SHA-pinned)
       # The friendly bash-3.2 guard MUST fire on system /bin/bash:
       #   exit 1  AND  stderr contains 'requires bash >= 4.4'
       - name: bash-3.2 guard fires
