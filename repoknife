@@ -2581,11 +2581,11 @@ cli::help() {
     config   [list]               orgs · ADO defaults · fork filter
 
   FLAGS
-    --org <org>        target org/account        --provider <p>   github|azure-devops|gitlab
+    --org <org>        target org/account        --provider <p>   github|azure-devops|gitlab (gitlab = stub)
     --no-forks         exclude forks (sync)      --refresh        bypass the repo-list cache
-    --dry-run          print actions, change nothing
+    --dry-run          print actions, change nothing (honored by sync · init)
     --all              non-interactive: act on every actionable repo (sync)
-    --plain            no color/TUI (auto when piped; NO_COLOR honored)
+    --plain            no color/TUI (auto when piped; alias --no-color; NO_COLOR honored)
     --exit-code        health: exit with the attention count (CI gate)
     -h --help          this screen                -V --version    print version
 
@@ -2595,6 +2595,8 @@ cli::help() {
     <code-root>/azure-devops/<org>/<project>/<repo>   ADO (3-level)
     code root: ~/Code by default · config code_root · REPOKNIFE_CODE_ROOT env wins
     config:    ~/.repoknife.conf (installed) · repo-adjacent .repoknife.conf (dev runs)
+    env:       REPOKNIFE_CFG_FILE (config path) · REPOKNIFE_CACHE_TTL (s, default 3600)
+               REPOKNIFE_JOBS (parallel workers, default 8) · REPOKNIFE_NO_DISCOVER=1 (offline ADO)
     gitflow: main + develop (develop = default branch)
 
   DEPS  gum · fzf · jq · gh · git   (az optional, for Azure DevOps)
