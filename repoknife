@@ -95,7 +95,14 @@ INTERACTIVE=0
 PLAIN="${PLAIN:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 EXCLUDE_FORKS="${EXCLUDE_FORKS:-0}"
-export PLAIN DRY_RUN EXCLUDE_FORKS
+# sync mirrors every origin branch into refs/heads by default (config key
+# sync_all_branches=false, or --no-all-branches, turns it off)
+ALL_BRANCHES="${ALL_BRANCHES:-1}"
+export PLAIN DRY_RUN EXCLUDE_FORKS ALL_BRANCHES
+# sentinel: an explicit --all-branches/--no-all-branches must beat the config key.
+# NOT exported — _worker exits before cfg::load ever runs, so a child can only
+# ever see the already-resolved ALL_BRANCHES value.
+ALL_BRANCHES_SET=0
 USE_EXIT_CODE=0
 REFRESH=0
 ALL=0
@@ -352,7 +359,7 @@ cfg::is_allowed_key() {
   case "$1" in
     extra_orgs_github|extra_orgs_gitlab|extra_orgs_azure-devops\
     |ado_default_org|ado_project_map|default_visibility|exclude_forks_default\
-    |code_root)
+    |code_root|sync_all_branches)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -377,6 +384,21 @@ cfg::load() {
 }
 
 cfg::get() { printf '%s' "${CFG[$1]:-${2:-}}"; }
+
+# config → mutable run-state. Called AFTER cli::parse_args, so it must never
+# stomp an explicitly-passed flag:
+#  · exclude_forks_default is opt-IN  — it can only ever turn the filter ON, and
+#    --no-forks does the same, so the two compose without a sentinel.
+#  · sync_all_branches is opt-OUT — "on" is the default, so it needs
+#    ALL_BRANCHES_SET to tell "user typed --all-branches" from "user typed
+#    nothing". Anything other than the exact string "false" leaves the default.
+cfg::apply_run_flags() {
+  [ "$(cfg::get exclude_forks_default)" = "true" ] && EXCLUDE_FORKS=1
+  if [ "$ALL_BRANCHES_SET" -eq 0 ] && [ "$(cfg::get sync_all_branches)" = "false" ]; then
+    ALL_BRANCHES=0
+  fi
+  return 0
+}
 
 cfg::set() {  # $1=key $2=value — atomic rewrite preserving other lines
   local key="$1" val="$2"
@@ -622,8 +644,11 @@ disco::init_candidates() {
 
 #============================================================================
 # SECTION 07 — GIT HELPERS  (git::*)
-#  Pure-local plumbing. Every helper is detached-HEAD / empty-repo / no-upstream
+#  Pure-local plumbing — no network anywhere in this section (sync's fetch lives
+#  in worker::do_pull). Every helper is detached-HEAD / empty-repo / no-upstream
 #  safe and never errors under set -e (callers rely on output, not rc).
+#  git::mirror_branches is the ONE mutator here: it writes refs/heads only —
+#  never the working tree, the index, or the checked-out branch.
 #============================================================================
 git::is_repo() { [ -e "$1/.git" ]; }
 
@@ -684,6 +709,79 @@ git::fetch_age() {  # compact age since last fetch, "never" if no FETCH_HEAD
   else m=$(stat -c '%Y' "$f" 2>/dev/null || echo 0); fi
   [ "$m" -eq 0 ] && { printf '?'; return 0; }
   ui::age "$m"
+}
+
+# ---------------------------------------------------------- branch mirroring
+# git::remote_branches <dir> → "name<TAB>sha" per origin branch.
+#  Only 'origin' is consulted: a fork cloned by `gh repo clone` also carries an
+#  'upstream' remote, and mirroring the PARENT's branches is never what we want.
+#  Filtered out: origin/HEAD (a symref, not a branch) and any name starting with
+#  '-' (it would be read as an option by the `git branch` calls below).
+git::remote_branches() {
+  git -C "$1" for-each-ref refs/remotes/origin \
+    --format='%(refname:strip=3)%09%(objectname)' 2>/dev/null \
+  | while IFS=$'\t' read -r name sha; do
+      case "$name" in ''|HEAD|-*) continue ;; esac
+      printf '%s\t%s\n' "$name" "$sha"
+    done
+}
+
+# git::mirror_branches <dir> → ensure every origin branch has a local counterpart.
+#  echoes "created<TAB>updated<TAB>diverged<TAB>failed". REF-ONLY: nothing here
+#  writes the working tree or the index, which is why sync can run it even on a
+#  dirty repo. The rules, in order of how much they can cost you:
+#    - no local branch          → create it, tracking origin/<b>
+#    - local is a strict ancestor of origin/<b> → fast-forward it
+#    - local has commits origin doesn't          → LEAVE IT (counted 'diverged')
+#    - local IS the checked-out branch           → LEAVE IT (that's the pull's job)
+#  `git branch -f` refuses on its own when the branch is checked out in a linked
+#  worktree, so that case lands in 'failed' rather than corrupting that worktree.
+git::mirror_branches() {
+  local dir="$1" cur name sha lname lsha
+  local created=0 updated=0 diverged=0 failed=0
+  # one pass over refs/heads up front: we only fork a `git branch` for the
+  # branches that genuinely need work (a 500-branch repo shouldn't cost 500 forks)
+  declare -A local_sha=()
+  while IFS=$'\t' read -r lname lsha; do
+    [ -n "$lname" ] && local_sha["$lname"]="$lsha"
+  done < <(git -C "$dir" for-each-ref refs/heads --format='%(refname:strip=2)%09%(objectname)' 2>/dev/null)
+  # symbolic-ref, NOT rev-parse: on an unborn HEAD rev-parse can't name the branch,
+  # and creating that branch underneath an unborn-but-checked-out HEAD would leave
+  # the index reporting every file in it as deleted. Empty when detached — no
+  # branch is checked out then, so every branch is fair game.
+  cur="$(git -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+  while IFS=$'\t' read -r name sha; do
+    # guard both paths: worker::do_pull owns the checked-out branch, and on an
+    # unborn HEAD that branch must not be conjured up underneath the empty index
+    [ "$name" = "$cur" ] && continue
+    if [ -z "${local_sha[$name]+x}" ]; then
+      if git -C "$dir" branch -q --track "$name" "refs/remotes/origin/$name" 2>/dev/null; then
+        created=$((created+1))
+      else failed=$((failed+1)); fi
+      continue
+    fi
+    [ "${local_sha[$name]}" = "$sha" ] && continue   # already identical
+    if git -C "$dir" merge-base --is-ancestor "refs/heads/$name" "refs/remotes/origin/$name" 2>/dev/null; then
+      if git -C "$dir" branch -q -f "$name" "refs/remotes/origin/$name" 2>/dev/null; then
+        updated=$((updated+1))
+      else failed=$((failed+1)); fi
+    else
+      diverged=$((diverged+1))   # unpushed local commits — never clobber them
+    fi
+  done < <(git::remote_branches "$dir")
+  printf '%s\t%s\t%s\t%s' "$created" "$updated" "$diverged" "$failed"
+}
+
+# git::mirror_note <created> <updated> <diverged> <failed> → " · +3 branch(es), 1 fast-forwarded"
+#  Suffix appended to a sync result message; empty when nothing happened.
+git::mirror_note() {
+  local out=""
+  [ "$1" -gt 0 ] && out="$out, +$1 branch(es)"
+  [ "$2" -gt 0 ] && out="$out, $2 fast-forwarded"
+  [ "$3" -gt 0 ] && out="$out, $3 diverged (left alone)"
+  [ "$4" -gt 0 ] && out="$out, $4 failed"
+  [ -z "$out" ] && return 0
+  printf ' · %s' "${out#, }"
 }
 
 #============================================================================
@@ -980,29 +1078,48 @@ worker::do_syncstate() {
 }
 
 # --- pull verb: item = repo relpath → "ok|skip|error <rel> <message>" --------
+# Order is deliberate: the fetch and the branch mirroring sit ABOVE the dirty
+# gate. Both are ref-only — neither touches the working tree, the index, nor the
+# checked-out branch — so a repo you're actively editing still gets every remote
+# branch locally; it just doesn't get pulled. (gotcha #11 is about the WORKING
+# TREE being left untouched, which still holds.)
 worker::do_pull() {
-  local rel="$1" dir before after n
+  local rel="$1" dir before after n note="" mirror created updated diverged failed
+  local ffcmd=()
   dir="$CODE_ROOT/$rel"
   if [ "$DRY_RUN" -eq 1 ]; then printf 'ok\t%s\tDRY: would pull\n' "$rel"; return 0; fi
+  # explicit refspec: a --single-branch clone has a narrow remote.origin.fetch and
+  # would otherwise never learn the other branches exist. --prune also keeps
+  # git::gone_count / git::fetch_age honest for health.
+  git -C "$dir" fetch --quiet --prune origin '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
+  if [ "$ALL_BRANCHES" -eq 1 ]; then
+    mirror="$(git::mirror_branches "$dir")"
+    IFS=$'\t' read -r created updated diverged failed <<< "$mirror"
+    note="$(git::mirror_note "$created" "$updated" "$diverged" "$failed")"
+  fi
   if [ "$(git::dirty_count "$dir")" -gt 0 ]; then
-    printf 'skip\t%s\tdirty working tree\n' "$rel"; return 0
+    printf 'skip\t%s\tdirty working tree%s\n' "$rel" "$note"; return 0
   fi
   before="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)"
-  if ! git -C "$dir" pull --ff-only -q 2>/dev/null; then
-    printf 'error\t%s\tpull failed (diverged or no upstream) — resolve manually\n' "$rel"
+  # we already fetched, so fast-forward locally rather than pay a second network
+  # round-trip per repo. An unborn HEAD can't be merged INTO — let pull do that one.
+  if git::is_empty "$dir"; then ffcmd=(pull --ff-only -q)
+  else ffcmd=(merge --ff-only -q '@{upstream}'); fi
+  if ! git -C "$dir" "${ffcmd[@]}" 2>/dev/null; then
+    printf 'error\t%s\tpull failed (diverged or no upstream) — resolve manually%s\n' "$rel" "$note"
     return 0
   fi
   after="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)"
-  if [ "$before" = "$after" ]; then printf 'ok\t%s\talready up to date\n' "$rel"
+  if [ "$before" = "$after" ]; then printf 'ok\t%s\talready up to date%s\n' "$rel" "$note"
   else
     n="$(git -C "$dir" rev-list --count "$before..$after" 2>/dev/null || echo '?')"
-    printf 'ok\t%s\tpulled %s commit(s)\n' "$rel" "$n"
+    printf 'ok\t%s\tpulled %s commit(s)%s\n' "$rel" "$n" "$note"
   fi
 }
 
 # --- clone verb: item = "relpath<TAB>clone_url<TAB>default_branch" ------------
 worker::do_clone() {
-  local rel url defbranch dir
+  local rel url defbranch dir note="" mirror created updated diverged failed
   IFS=$'\t' read -r rel url defbranch <<< "$1"
   dir="$CODE_ROOT/$rel"
   if [ "$DRY_RUN" -eq 1 ]; then printf 'ok\t%s\tDRY: would clone\n' "$rel"; return 0; fi
@@ -1025,7 +1142,14 @@ worker::do_clone() {
   if git -C "$dir" show-ref --verify --quiet refs/remotes/origin/develop; then
     git -C "$dir" checkout -q develop 2>/dev/null || true
   fi
-  printf 'ok\t%s\tcloned%s\n' "$rel" "$( [ "$defbranch" != "-" ] && printf ' (default %s)' "$defbranch" )"
+  # a fresh clone already has every branch under refs/remotes/origin/* (default
+  # refspec) — no extra fetch needed, just materialize them as local branches
+  if [ "$ALL_BRANCHES" -eq 1 ]; then
+    mirror="$(git::mirror_branches "$dir")"
+    IFS=$'\t' read -r created updated diverged failed <<< "$mirror"
+    note="$(git::mirror_note "$created" "$updated" "$diverged" "$failed")"
+  fi
+  printf 'ok\t%s\tcloned%s%s\n' "$rel" "$( [ "$defbranch" != "-" ] && printf ' (default %s)' "$defbranch" )" "$note"
 }
 
 # --- runs verb: item = "owner/repo" → recent workflow-run rows ----------------
@@ -2225,18 +2349,19 @@ mod::config() {
     log::info "config file: $CFG_FILE"
     local k
     for k in code_root extra_orgs_github extra_orgs_gitlab extra_orgs_azure-devops \
-             ado_default_org ado_project_map default_visibility exclude_forks_default; do
+             ado_default_org ado_project_map default_visibility exclude_forks_default \
+             sync_all_branches; do
       printf '  %-26s = %s\n' "$k" "$(cfg::get "$k" "(unset)")"
     done
     return 0
   fi
   while :; do
     local key val
-    ui::page "Config" "code root · orgs not yet cloned · ADO org:project map · repo-create visibility · fork filter" "$CFG_FILE"
+    ui::page "Config" "code root · orgs not yet cloned · ADO org:project map · repo-create visibility · fork filter · branch mirroring" "$CFG_FILE"
     key="$(ui::menu "🔧 config · $CFG_FILE" \
           "code_root" "extra_orgs_github" "extra_orgs_azure-devops" "extra_orgs_gitlab" \
           "ado_default_org" "ado_project_map" "default_visibility" \
-          "exclude_forks_default" "📄  show all" "←  Back")" || return 0
+          "exclude_forks_default" "sync_all_branches" "📄  show all" "←  Back")" || return 0
     case "$key" in
       *show*) mod::config list; ui::is_interactive && { printf '  (enter to continue) '; read -r || true; } ;;
       *Back*) return 0 ;;
@@ -2246,15 +2371,19 @@ mod::config() {
         case "$key" in
           default_visibility) ph='private|public' ;;
           code_root)          ph='~/Code' ;;
+          exclude_forks_default|sync_all_branches) ph='true|false' ;;
         esac
         val="$(ui::input "$key (current: $(cfg::get "$key" "unset"))" "$ph")" || continue
         [ -z "$val" ] && continue
         if [ "$key" = "default_visibility" ] && [ "$val" != private ] && [ "$val" != public ]; then
           ui::toast err "must be 'private' or 'public'"; continue
         fi
-        if [ "$key" = "exclude_forks_default" ] && [ "$val" != true ] && [ "$val" != false ]; then
-          ui::toast err "must be 'true' or 'false'"; continue
-        fi
+        case "$key" in
+          exclude_forks_default|sync_all_branches)
+            if [ "$val" != true ] && [ "$val" != false ]; then
+              ui::toast err "must be 'true' or 'false'"; continue
+            fi ;;
+        esac
         if [ "$key" = "code_root" ]; then
           local exp; exp="$(path::expand_tilde "$val")"
           if [ ! -d "$exp" ]; then
@@ -2583,6 +2712,7 @@ cli::help() {
   FLAGS
     --org <org>        target org/account        --provider <p>   github|azure-devops|gitlab (gitlab = stub)
     --no-forks         exclude forks (sync)      --refresh        bypass the repo-list cache
+    --no-all-branches  sync: don't mirror every remote branch into a local one (default: mirror)
     --dry-run          print actions, change nothing (honored by sync · init)
     --all              non-interactive: act on every actionable repo (sync)
     --plain            no color/TUI (auto when piped; alias --no-color; NO_COLOR honored)
@@ -2609,6 +2739,8 @@ cli::parse_args() {
     case "$1" in
       --plain|--no-color) PLAIN=1 ;;
       --no-forks)         EXCLUDE_FORKS=1 ;;
+      --all-branches)     ALL_BRANCHES=1; ALL_BRANCHES_SET=1 ;;
+      --no-all-branches)  ALL_BRANCHES=0; ALL_BRANCHES_SET=1 ;;
       --dry-run)          DRY_RUN=1 ;;
       --all)              ALL=1 ;;
       --refresh)          REFRESH=1 ;;
@@ -2733,7 +2865,7 @@ cli::dispatch() {
   cfg::load
   cfg::bootstrap
   cfg::firstrun
-  [ "$(cfg::get exclude_forks_default)" = "true" ] && EXCLUDE_FORKS=1
+  cfg::apply_run_flags
 
   case "$CMD" in
     "")        menu::loop ;;
@@ -2822,7 +2954,7 @@ EOF
   t::check "cfg set+reload" "private" "$(cfg::get default_visibility)"
   t::check "cfg set preserves others" "corp:Proj" "$(cfg::get ado_project_map)"
   t::check "conf template in sync" \
-    "ado_default_org ado_project_map code_root default_visibility exclude_forks_default extra_orgs_azure-devops extra_orgs_github extra_orgs_gitlab" \
+    "ado_default_org ado_project_map code_root default_visibility exclude_forks_default extra_orgs_azure-devops extra_orgs_github extra_orgs_gitlab sync_all_branches" \
     "$(grep -Eo '^[a-z_-]+=' "$(dirname "$REPOKNIFE_SELF")/.repoknife.conf" | sed 's/=$//' | sort | tr '\n' ' ' | sed 's/ $//')"
 
   # --- release plumbing: VERSION parses (same grep release.yml uses) + guard string present ---
@@ -2987,6 +3119,12 @@ EOF
   t::check "winmath done fills rest" "2 7"    "$(batch::winmath 10 2 50)"
   t::check "winmath tiny terminal"  "1 0"     "$(batch::winmath 1 5 5)"
 
+  # --- mirror note formatting (pure: no git needed) ---
+  t::check "mirror note empty"   ""                                    "$(git::mirror_note 0 0 0 0)"
+  t::check "mirror note created" " · +3 branch(es)"                    "$(git::mirror_note 3 0 0 0)"
+  t::check "mirror note all"     " · +1 branch(es), 2 fast-forwarded, 3 diverged (left alone), 4 failed" \
+                                                                       "$(git::mirror_note 1 2 3 4)"
+
   # --- worker fanout round-trip (xargs + item files preserve tabs) ---
   local fan
   fan="$(DRY_RUN=1 worker::fanout syncitem <<< $'pull\tgithub/acme/widget')"
@@ -2996,6 +3134,7 @@ EOF
   t::check "exclude_forks exported" "yes" "$(declare -p EXCLUDE_FORKS 2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
   t::check "plain exported"         "yes" "$(declare -p PLAIN         2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
   t::check "dry_run exported"       "yes" "$(declare -p DRY_RUN       2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
+  t::check "all_branches exported"  "yes" "$(declare -p ALL_BRANCHES  2>/dev/null | grep -q 'declare -x' && echo yes || echo no)"
 
   # --- tmp::dir lives beneath the per-process root so the cleanup trap can reap it ---
   t::check "tmp dir under root" "yes" "$(d="$(tmp::dir)"; case "$d" in "$RK_TMP_ROOT"/*) echo yes ;; *) echo no ;; esac)"
@@ -3007,7 +3146,31 @@ EOF
   t::check "args forks" "1" "$EXCLUDE_FORKS"
   t::check "args dry" "1" "$DRY_RUN"
   t::check "args positional" "extra" "${CMD_ARGS[0]:-}"
+  t::check "args all-branches default" "1" "$ALL_BRANCHES"
+  t::check "args all-branches sentinel default" "0" "$ALL_BRANCHES_SET"
+  cli::parse_args sync --no-all-branches
+  t::check "args --no-all-branches" "1|0" "$ALL_BRANCHES_SET|$ALL_BRANCHES"
+  cli::parse_args sync --all-branches
+  t::check "args --all-branches" "1|1" "$ALL_BRANCHES_SET|$ALL_BRANCHES"
+  ALL_BRANCHES=1 ALL_BRANCHES_SET=0
   DRY_RUN=0 EXCLUDE_FORKS=0
+
+  # --- config → run-state (an explicit flag must survive the opt-out key) ---
+  CFG=()
+  cfg::apply_run_flags
+  t::check "cfg run-state defaults" "1|0" "$ALL_BRANCHES|$EXCLUDE_FORKS"
+  CFG[sync_all_branches]=false; CFG[exclude_forks_default]=true
+  cfg::apply_run_flags
+  t::check "cfg turns mirroring off" "0|1" "$ALL_BRANCHES|$EXCLUDE_FORKS"
+  ALL_BRANCHES=1 ALL_BRANCHES_SET=1   # as if --all-branches had been passed
+  cfg::apply_run_flags
+  t::check "flag beats cfg off-switch" "1" "$ALL_BRANCHES"
+  # only the exact string "false" disables — a typo must not silently opt you out
+  CFG=(); CFG[sync_all_branches]=False
+  ALL_BRANCHES=1 ALL_BRANCHES_SET=0
+  cfg::apply_run_flags
+  t::check "cfg non-false keeps default" "1" "$ALL_BRANCHES"
+  CFG=(); ALL_BRANCHES=1 ALL_BRANCHES_SET=0 EXCLUDE_FORKS=0
 
   # --- git helpers on a real fixture repo ---
   if command -v git >/dev/null; then
@@ -3053,6 +3216,9 @@ EOF
     # local bare "remote" → sync / gone / "ahead 1" / local all on one fixture
     local bare="$fix/remote.git" repo3="$fix/github/acme/tracked"
     git init -q --bare "$bare"
+    # a real remote always has a resolvable HEAD; `git init --bare` points it at
+    # the (never-pushed) default name, which makes clones land on an UNBORN branch
+    git -C "$bare" symbolic-ref HEAD refs/heads/main
     git init -q -b main "$repo3"
     ( cd "$repo3" \
       && git remote add origin "$bare" \
@@ -3066,6 +3232,43 @@ EOF
       && git branch -q localb ) || true
     t::check "branch_rows trackclasses" "ahead1:ahead 1 feat-gone:gone localb:local main:sync" \
       "$(git::branch_rows "$repo3" | awk -F'\t' '{print $1 ":" $3}' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+    # --- branch mirroring: create missing · fast-forward behind · never clobber ---
+    # $bare carries main + ahead1 (ahead1 at the PUSHED commit; repo3 has one more
+    # locally that was never pushed — the "diverged" case below).
+    local repo5="$fix/github/acme/mirror"
+    git clone -q "$bare" "$repo5" 2>/dev/null
+    # origin/HEAD must never be offered as a branch to create
+    t::check "remote_branches skips HEAD" "ahead1 main" \
+      "$(git::remote_branches "$repo5" | cut -f1 | sort | tr '\n' ' ' | sed 's/ $//')"
+    # a fresh clone has only the default branch locally → ahead1 gets created
+    t::check "mirror creates missing" $'1\t0\t0\t0' "$(git::mirror_branches "$repo5")"
+    t::check "mirror created is tracking" "ahead1:sync" \
+      "$(git::branch_rows "$repo5" | awk -F'\t' '$1=="ahead1"{print $1 ":" $3}')"
+    t::check "mirror is idempotent" $'0\t0\t0\t0' "$(git::mirror_branches "$repo5")"
+    # move origin/ahead1 forward, re-fetch → the local branch must fast-forward onto it
+    ( cd "$repo3" && git push -q origin ahead1 && cd "$repo5" && git fetch -q -p ) || true
+    t::check "mirror fast-forwards behind" $'0\t1\t0\t0' "$(git::mirror_branches "$repo5")"
+    t::check "mirror ff landed on remote sha" "yes" \
+      "$([ "$(git -C "$repo5" rev-parse ahead1)" = "$(git -C "$repo5" rev-parse origin/ahead1)" ] && echo yes || echo no)"
+    # the checked-out branch is the pull's job: move origin/main ahead, and mirror
+    # must leave the local (behind) main alone
+    ( cd "$repo3" && git checkout -q main \
+      && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m onmain \
+      && git push -q origin main && cd "$repo5" && git fetch -q -p ) || true
+    local mainsha; mainsha="$(git -C "$repo5" rev-parse main)"
+    t::check "mirror skips checked-out branch" $'0\t0\t0\t0' "$(git::mirror_branches "$repo5")"
+    t::check "mirror left current branch put" "$mainsha" "$(git -C "$repo5" rev-parse main)"
+    # repo3's ahead1 has unpushed commits relative to a now-rewound remote view:
+    # rewind origin/ahead1 in a THIRD clone so local is strictly ahead → diverged
+    local repo6="$fix/github/acme/diverge"
+    git clone -q "$bare" "$repo6" 2>/dev/null
+    ( cd "$repo6" && git checkout -q -b ahead1 origin/ahead1 \
+      && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m unpushed \
+      && git checkout -q main ) || true   # ahead1 must NOT be current, or mirror skips it for that reason
+    local divsha; divsha="$(git -C "$repo6" rev-parse ahead1)"
+    t::check "mirror leaves diverged alone" $'0\t0\t1\t0' "$(git::mirror_branches "$repo6")"
+    t::check "mirror kept unpushed commit" "$divsha" "$(git -C "$repo6" rev-parse ahead1)"
 
     # --- worker::do_status EMPTY/unborn row: 10 cols, rank 7, symbolic-ref name ---
     # (rev-parse lies "HEAD" on an unborn branch — the row must carry the real name)
