@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 driven by [Conventional Commits](https://www.conventionalcommits.org).
 
+## [1.9.0] - 2026-07-29
+
+### Features
+
+- **sync**: Mirror every remote branch into a local tracking branch ([`222c423`](https://github.com/floriangrousset/repoknife/commit/222c4232bc0d75b8a2885b85f2562853837ad581))
+
 ## [1.8.2] - 2026-06-12
 
 ### Bug Fixes
@@ -75,6 +81,8 @@ driven by [Conventional Commits](https://www.conventionalcommits.org).
 ### Documentation
 
 - Add CLAUDE.md dev guide and .gitignore ([`a42ad74`](https://github.com/floriangrousset/repoknife/commit/a42ad7425be93f162353657deec0f120d7c0c104))
+
+[1.9.0]: https://github.com/floriangrousset/repoknife/compare/v1.8.2..v1.9.0
 
 [1.8.2]: https://github.com/floriangrousset/repoknife/compare/v1.8.1..v1.8.2
 
