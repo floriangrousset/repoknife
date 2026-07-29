@@ -18,12 +18,12 @@ repo bootstrapping — built on `gum` + `fzf` + `gh`.
 | Module | |
 |---|---|
 | ✨ **Init** | turn plain folders into gitflow repos (`main` + `develop`, develop default) with optional GitHub remote creation |
-| 🔁 **Sync** | fetch an org's remote repo list, multi-select, batch clone/pull with live git progress — dirty repos are skipped, never touched. Azure DevOps orgs & projects are auto-discovered live via `az` |
+| 🔁 **Sync** | fetch an org's remote repo list, multi-select, batch clone/pull with live git progress — and mirror **every** remote branch into a local tracking branch. Dirty repos keep their working tree untouched. Azure DevOps orgs & projects are auto-discovered live via `az` |
 | 🔀 **PRs** | cross-org PR dashboard (authored / review-requested / assigned / mentioned) with checkout, diff, approve, merge — merge strategy follows gitflow (squash→develop, merge-commit→main) |
 | 🤖 **Actions** | recent workflow runs across repos — watch live, re-run failed, failure logs |
 | 💚 **Health** | every local repo, worst-first: dirty, diverged, behind/ahead, gone branches, missing develop — with one-keystroke fixes |
 | 🧹 **Cleanup** | delete `[gone]`/`[merged]` branches (`main`/`develop`/current always protected), sync develop ← main |
-| 🔧 **Config** | extra orgs, optional Azure DevOps org→project map (offline fallback), repo-create visibility, fork filter |
+| 🔧 **Config** | extra orgs, optional Azure DevOps org→project map (offline fallback), repo-create visibility, fork filter, branch mirroring |
 
 Run bare for the interactive menu, or script it: every module is a subcommand
 (`repoknife health --plain`, `repoknife sync --org acme --dry-run`, …) with a
@@ -136,6 +136,7 @@ enable re-running failed Actions jobs.
 - Failure UX: missing tools, an unauthenticated `gh`/`az`, and the workflow-scope gap are detected and **offered as a one-keypress fix** interactively (the exact command is shown verbatim before it runs); in `--plain` mode the copy-paste command is printed and the original exit code preserved
 - Exit codes: `0` ok (ESC/cancel included) · `1` usage/deps · `2` auth · `health --exit-code` exits with the attention count to gate CI
 - `--dry-run` previews what **sync** and **init** would do; the PR / cleanup / runs screens are interactive and confirm each mutation explicitly instead
+- Branch mirroring: **sync** fetches with `--prune` and gives every branch on `origin` a local tracking branch, fast-forwarding the ones that are merely behind. It never rewrites a branch holding unpushed commits (reported as `diverged (left alone)`) and never touches the checked-out branch — so it is safe to run on a dirty repo, which still gets its branches even though the pull is skipped. Turn it off with `--no-all-branches` for one run, or `sync_all_branches=false` in the config; `--all-branches` overrides the config back on
 - GitLab: the folder convention is fully supported, but remote operations (list/clone/create) are stubbed in v1 — `glab` integration is on the roadmap
 - Environment variables: `REPOKNIFE_CODE_ROOT` (pin the code root) · `REPOKNIFE_CFG_FILE` (config path) · `REPOKNIFE_CACHE_TTL` (cache seconds, default 3600) · `REPOKNIFE_JOBS` (parallel workers, default 8, max 64) · `REPOKNIFE_NO_DISCOVER=1` (skip live ADO discovery)
 - Versioning & changelog: automatic [SemVer](https://semver.org) derived from [Conventional Commits](https://www.conventionalcommits.org) — every release is cut and the [CHANGELOG](CHANGELOG.md) is regenerated automatically (via [git-cliff](https://git-cliff.org)). `repoknife --version` reports the released version; a dev checkout also prints its `git describe` build line
